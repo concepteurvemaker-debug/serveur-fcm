@@ -1,45 +1,44 @@
-const express = require('express')
-const bodyParser = require('body-parser')
-const admin = require('firebase-admin')
+const express = require("express");
+const admin = require("firebase-admin");
 
-const app = express()
-app.use(bodyParser.json())
+const app = express();
+app.use(express.json());
 
-// 🔑 Import du fichier Firebase (IMPORTANT)
-const serviceAccount = require('./fcm-service.json')
+// 🔑 Firebase via variable d'environnement
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
 
-// 🔥 Initialisation Firebase
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
-})
+  credential: admin.credential.cert(serviceAccount),
+});
 
 // ✅ Route test
-app.get('/', (req, res) => {
-  res.send('Serveur FCM OK 🚀')
-})
+app.get("/", (req, res) => {
+  res.send("Serveur FCM OK 🚀");
+});
 
-// 🔔 Route pour envoyer notification à tous
-app.get('/send', async (req, res) => {
-
+// 🔔 Route notification
+app.post("/send", async (req, res) => {
   const message = {
     notification: {
-      title: '🔥 Nouvelle alerte',
-      body: 'Ceci est une notification envoyée à tous !'
+      title: req.body.title || "🔥 Nouvelle alerte",
+      body: req.body.body || "Ceci est une notification envoyée à tous !",
     },
-    topic: 'all'
-  }
+    topic: "all",
+  };
 
   try {
-    const response = await admin.messaging().send(message)
-    console.log('Notification envoyée :', response)
-    res.send('Notification envoyée ✅')
+    const response = await admin.messaging().send(message);
+    console.log("Notification envoyée :", response);
+    res.send("Notification envoyée ✅");
   } catch (error) {
-    console.error(error)
-    res.send('Erreur ❌')
+    console.error(error);
+    res.status(500).send("Erreur ❌");
   }
-})
+});
 
-// 🚀 Lancement serveur
-app.listen(3000, () => {
-  console.log('Running on port 3000')
-})
+// 🚀 Lancement serveur (IMPORTANT pour Render)
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log("Running on port " + PORT);
+});

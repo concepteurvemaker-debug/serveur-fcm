@@ -1,3 +1,6 @@
+console.log("Server starting...");
+console.log("ENV FIREBASE:", !!process.env.FIREBASE_KEY);
+
 const express = require("express");
 const admin = require("firebase-admin");
 

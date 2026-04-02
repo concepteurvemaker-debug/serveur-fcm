@@ -14,9 +14,16 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// ⚡ Stockage dynamique des utilisateurs connectés
-// Structure : { token: string, lat: number, lng: number, lastUpdate: Date }
-let users = [];
+// ⚡ Stockage dynamique des véhicules de secours
+// { token, lat, lng, lastUpdate }
+let vehicles = [];
+
+// ⚡ Stockage des utilisateurs pour notifications
+let users = [
+  { token: "token_utilisateur_1", lat: 48.8567, lng: 2.3525 },
+  { token: "token_utilisateur_2", lat: 48.8570, lng: 2.3530 },
+  // Ajouter ici les tokens réels
+];
 
 // 📏 Calcul distance Haversine
 function distance(lat1, lon1, lat2, lon2) {
@@ -36,50 +43,44 @@ function distance(lat1, lon1, lat2, lon2) {
 
 // ✅ Route test
 app.get("/", (req, res) => {
-  res.send("Serveur FCM dynamique OK 🚀");
+  res.send("Serveur FCM OK 🚀");
 });
 
-// 🔔 Route pour mise à jour position usager
-// L’app Android doit envoyer { token, lat, lng } toutes les secondes
+// -------------------- Recevoir position toutes les secondes --------------------
 app.post("/update-position", (req, res) => {
   const { token, lat, lng } = req.body;
-
-  if (!token || lat === undefined || lng === undefined) {
-    return res.status(400).send("Paramètres manquants");
-  }
+  if (!token || !lat || !lng) return res.status(400).send("Données manquantes");
 
   const now = Date.now();
-  const existing = users.find((u) => u.token === token);
-  if (existing) {
-    existing.lat = lat;
-    existing.lng = lng;
-    existing.lastUpdate = now;
-  } else {
-    users.push({ token, lat, lng, lastUpdate: now });
-  }
+  const index = vehicles.findIndex(v => v.token === token);
 
-  // Nettoyage des usagers inactifs (>30 sec)
-  users = users.filter((u) => now - u.lastUpdate <= 30 * 1000);
+  if (index >= 0) {
+    // Mettre à jour
+    vehicles[index].lat = lat;
+    vehicles[index].lng = lng;
+    vehicles[index].lastUpdate = now;
+  } else {
+    // Nouveau véhicule
+    vehicles.push({ token, lat, lng, lastUpdate: now });
+  }
 
   res.send("Position mise à jour ✅");
 });
 
-// 🔔 Route pour alerte service urgence
+// -------------------- Envoyer alerte ponctuelle --------------------
 app.post("/alert", async (req, res) => {
   const { lat, lng } = req.body;
   const RAYON = 150; // m
 
-  if (lat === undefined || lng === undefined) {
-    return res.status(400).send("Position manquante");
-  }
+  if (!lat || !lng) return res.status(400).send("Position manquante");
 
   // Filtrer les utilisateurs dans le rayon
-  const proches = users.filter((u) => distance(lat, lng, u.lat, u.lng) <= RAYON);
+  const proches = users.filter(u => distance(lat, lng, u.lat, u.lng) <= RAYON);
 
   if (proches.length === 0) return res.send("Aucun usager à proximité");
 
-  // Envoyer notification à chaque utilisateur proche
-  const messages = proches.map((u) => ({
+  // Envoyer notification
+  const messages = proches.map(u => ({
     token: u.token,
     notification: {
       title: "🚨 Service d'urgence à proximité",
@@ -96,6 +97,15 @@ app.post("/alert", async (req, res) => {
     res.status(500).send("Erreur serveur ❌");
   }
 });
+
+// -------------------- Nettoyage véhicules inactifs --------------------
+setInterval(() => {
+  const now = Date.now();
+  const before = vehicles.length;
+  vehicles = vehicles.filter(v => now - v.lastUpdate <= 10_000); // max 10s sans update
+  const removed = before - vehicles.length;
+  if (removed > 0) console.log(`Véhicules inactifs supprimés: ${removed}`);
+}, 10_000);
 
 // 🚀 Lancement serveur
 const PORT = process.env.PORT || 3000;

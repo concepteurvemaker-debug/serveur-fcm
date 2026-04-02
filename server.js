@@ -15,10 +15,10 @@ admin.initializeApp({
 });
 
 // ⚡ Stockage temporaire des utilisateurs avec token et position
+// Exemple : à remplacer par vraie base utilisateur / tokens FCM
 let users = [
   { token: "token_utilisateur_1", lat: 48.8567, lng: 2.3525 },
   { token: "token_utilisateur_2", lat: 48.8570, lng: 2.3530 },
-  // Ajouter ici les tokens réels des utilisateurs
 ];
 
 // 📏 Calcul distance Haversine
@@ -47,14 +47,18 @@ app.post("/alert", async (req, res) => {
   const { lat, lng } = req.body;
   const RAYON = 150; // m
 
-  if (!lat || !lng) return res.status(400).send("Position manquante");
+  if (lat === undefined || lng === undefined) {
+    return res.status(400).send("Position manquante");
+  }
 
   // Filtrer les utilisateurs dans le rayon
   const proches = users.filter((u) => distance(lat, lng, u.lat, u.lng) <= RAYON);
 
-  if (proches.length === 0) return res.send("Aucun usager à proximité");
+  if (proches.length === 0) {
+    return res.send("Aucun usager à proximité");
+  }
 
-  // Envoyer notification à chaque utilisateur proche
+  // Créer les messages pour FCM
   const messages = proches.map((u) => ({
     token: u.token,
     notification: {

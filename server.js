@@ -15,7 +15,7 @@ admin.initializeApp({
 });
 
 // ⚡ Stockage temporaire utilisateurs et véhicules Secours
-let users = [];        // { token, lat, lng, lastUpdate }
+let users = [];           // { token, lat, lng, modePublic, lastUpdate }
 let secoursVehicles = []; // { token, lat, lng, lastUpdate }
 
 // 📏 Calcul distance Haversine
@@ -39,16 +39,17 @@ app.get("/", (req, res) => res.send("Serveur FCM OK 🚀"));
 
 // 🧑‍💻 Inscription ou mise à jour d'un utilisateur
 app.post("/register-user", (req, res) => {
-  const { token, lat, lng } = req.body;
+  const { token, lat, lng, modePublic } = req.body;
   if (!token || !lat || !lng) return res.status(400).send("Données manquantes");
 
   const index = users.findIndex(u => u.token === token);
   if (index >= 0) {
     users[index].lat = lat;
     users[index].lng = lng;
+    users[index].modePublic = modePublic; // ✅ nouveau champ
     users[index].lastUpdate = Date.now();
   } else {
-    users.push({ token, lat, lng, lastUpdate: Date.now() });
+    users.push({ token, lat, lng, modePublic, lastUpdate: Date.now() });
   }
 
   res.send("Utilisateur enregistré ou mis à jour ✅");
@@ -89,7 +90,8 @@ function sendNearbyNotifications(lat, lng) {
   const messages = [];
 
   users.forEach(u => {
-    if (distance(lat, lng, u.lat, u.lng) <= RAYON && !notifiedTokens.has(u.token)) {
+    // ⚡ n’envoyer que si l’utilisateur est en mode Public
+    if (u.modePublic && distance(lat, lng, u.lat, u.lng) <= RAYON && !notifiedTokens.has(u.token)) {
       messages.push({
         token: u.token,
         notification: {

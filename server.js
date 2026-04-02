@@ -14,20 +14,13 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// ⚡ Stockage dynamique des véhicules de secours
-// { token, lat, lng, lastUpdate }
-let vehicles = [];
-
-// ⚡ Stockage des utilisateurs pour notifications
-let users = [
-  { token: "token_utilisateur_1", lat: 48.8567, lng: 2.3525 },
-  { token: "token_utilisateur_2", lat: 48.8570, lng: 2.3530 },
-  // Ajouter ici les tokens réels
-];
+// ⚡ Stockage temporaire utilisateurs et véhicules Secours
+let users = [];        // { token, lat, lng, lastUpdate }
+let secoursVehicles = []; // { token, lat, lng, lastUpdate }
 
 // 📏 Calcul distance Haversine
 function distance(lat1, lon1, lat2, lon2) {
-  const R = 6371e3; // en mètres
+  const R = 6371e3; // mètres
   const φ1 = lat1 * Math.PI / 180;
   const φ2 = lat2 * Math.PI / 180;
   const Δφ = (lat2 - lat1) * Math.PI / 180;
@@ -42,70 +35,91 @@ function distance(lat1, lon1, lat2, lon2) {
 }
 
 // ✅ Route test
-app.get("/", (req, res) => {
-  res.send("Serveur FCM OK 🚀");
+app.get("/", (req, res) => res.send("Serveur FCM OK 🚀"));
+
+// 🧑‍💻 Inscription ou mise à jour d'un utilisateur
+app.post("/register-user", (req, res) => {
+  const { token, lat, lng } = req.body;
+  if (!token || !lat || !lng) return res.status(400).send("Données manquantes");
+
+  const index = users.findIndex(u => u.token === token);
+  if (index >= 0) {
+    users[index].lat = lat;
+    users[index].lng = lng;
+    users[index].lastUpdate = Date.now();
+  } else {
+    users.push({ token, lat, lng, lastUpdate: Date.now() });
+  }
+
+  res.send("Utilisateur enregistré ou mis à jour ✅");
 });
 
-// -------------------- Recevoir position toutes les secondes --------------------
+// 🔔 Mise à jour position véhicule Secours
 app.post("/update-position", (req, res) => {
   const { token, lat, lng } = req.body;
   if (!token || !lat || !lng) return res.status(400).send("Données manquantes");
 
-  const now = Date.now();
-  const index = vehicles.findIndex(v => v.token === token);
-
+  const index = secoursVehicles.findIndex(v => v.token === token);
   if (index >= 0) {
-    // Mettre à jour
-    vehicles[index].lat = lat;
-    vehicles[index].lng = lng;
-    vehicles[index].lastUpdate = now;
+    secoursVehicles[index].lat = lat;
+    secoursVehicles[index].lng = lng;
+    secoursVehicles[index].lastUpdate = Date.now();
   } else {
-    // Nouveau véhicule
-    vehicles.push({ token, lat, lng, lastUpdate: now });
+    secoursVehicles.push({ token, lat, lng, lastUpdate: Date.now() });
   }
 
-  res.send("Position mise à jour ✅");
+  sendNearbyNotifications(lat, lng);
+  res.send("Position Secours mise à jour ✅");
 });
 
-// -------------------- Envoyer alerte ponctuelle --------------------
-app.post("/alert", async (req, res) => {
+// 🔔 Alerte ponctuelle (bouton Secours)
+app.post("/alert", (req, res) => {
   const { lat, lng } = req.body;
-  const RAYON = 150; // m
-
   if (!lat || !lng) return res.status(400).send("Position manquante");
 
-  // Filtrer les utilisateurs dans le rayon
-  const proches = users.filter(u => distance(lat, lng, u.lat, u.lng) <= RAYON);
-
-  if (proches.length === 0) return res.send("Aucun usager à proximité");
-
-  // Envoyer notification
-  const messages = proches.map(u => ({
-    token: u.token,
-    notification: {
-      title: "🚨 Service d'urgence à proximité",
-      body: "Un véhicule d'urgence est dans votre rayon de 150m",
-    },
-  }));
-
-  try {
-    const response = await admin.messaging().sendAll(messages);
-    console.log("Notifications envoyées :", response.successCount);
-    res.send(`Notifications envoyées: ${response.successCount}`);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("Erreur serveur ❌");
-  }
+  sendNearbyNotifications(lat, lng);
+  res.send("Alerte ponctuelle envoyée ✅");
 });
 
-// -------------------- Nettoyage véhicules inactifs --------------------
+// 📬 Fonction envoi notifications aux usagers proches
+function sendNearbyNotifications(lat, lng) {
+  const RAYON = 150; // m
+  const notifiedTokens = new Set(); // éviter le spam
+
+  const messages = [];
+
+  users.forEach(u => {
+    if (distance(lat, lng, u.lat, u.lng) <= RAYON && !notifiedTokens.has(u.token)) {
+      messages.push({
+        token: u.token,
+        notification: {
+          title: "🚨 Service d'urgence à proximité",
+          body: "Un véhicule d'urgence est dans votre rayon de 150m",
+        },
+      });
+      notifiedTokens.add(u.token);
+    }
+  });
+
+  if (messages.length === 0) {
+    console.log("Aucun usager à proximité pour notification");
+    return;
+  }
+
+  admin.messaging().sendAll(messages)
+    .then(response => {
+      console.log("Notifications envoyées:", response.successCount);
+    })
+    .catch(err => {
+      console.error("Erreur envoi notifications:", err);
+    });
+}
+
+// 🔧 Nettoyage périodique véhicules Secours inactifs (10s)
 setInterval(() => {
   const now = Date.now();
-  const before = vehicles.length;
-  vehicles = vehicles.filter(v => now - v.lastUpdate <= 10_000); // max 10s sans update
-  const removed = before - vehicles.length;
-  if (removed > 0) console.log(`Véhicules inactifs supprimés: ${removed}`);
-}, 10_000);
+  secoursVehicles = secoursVehicles.filter(v => now - v.lastUpdate < 15000); // 15s max
+}, 10000);
 
 // 🚀 Lancement serveur
 const PORT = process.env.PORT || 3000;

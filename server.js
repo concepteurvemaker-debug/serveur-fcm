@@ -14,12 +14,9 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// ⚡ Stockage temporaire des utilisateurs avec token et position
-// Exemple : à remplacer par vraie base utilisateur / tokens FCM
-let users = [
-  { token: "token_utilisateur_1", lat: 48.8567, lng: 2.3525 },
-  { token: "token_utilisateur_2", lat: 48.8570, lng: 2.3530 },
-];
+// ⚡ Stockage dynamique des utilisateurs connectés
+// Structure : { token: string, lat: number, lng: number, lastUpdate: Date }
+let users = [];
 
 // 📏 Calcul distance Haversine
 function distance(lat1, lon1, lat2, lon2) {
@@ -39,7 +36,32 @@ function distance(lat1, lon1, lat2, lon2) {
 
 // ✅ Route test
 app.get("/", (req, res) => {
-  res.send("Serveur FCM OK 🚀");
+  res.send("Serveur FCM dynamique OK 🚀");
+});
+
+// 🔔 Route pour mise à jour position usager
+// L’app Android doit envoyer { token, lat, lng } toutes les secondes
+app.post("/update-position", (req, res) => {
+  const { token, lat, lng } = req.body;
+
+  if (!token || lat === undefined || lng === undefined) {
+    return res.status(400).send("Paramètres manquants");
+  }
+
+  const now = Date.now();
+  const existing = users.find((u) => u.token === token);
+  if (existing) {
+    existing.lat = lat;
+    existing.lng = lng;
+    existing.lastUpdate = now;
+  } else {
+    users.push({ token, lat, lng, lastUpdate: now });
+  }
+
+  // Nettoyage des usagers inactifs (>30 sec)
+  users = users.filter((u) => now - u.lastUpdate <= 30 * 1000);
+
+  res.send("Position mise à jour ✅");
 });
 
 // 🔔 Route pour alerte service urgence
@@ -54,11 +76,9 @@ app.post("/alert", async (req, res) => {
   // Filtrer les utilisateurs dans le rayon
   const proches = users.filter((u) => distance(lat, lng, u.lat, u.lng) <= RAYON);
 
-  if (proches.length === 0) {
-    return res.send("Aucun usager à proximité");
-  }
+  if (proches.length === 0) return res.send("Aucun usager à proximité");
 
-  // Créer les messages pour FCM
+  // Envoyer notification à chaque utilisateur proche
   const messages = proches.map((u) => ({
     token: u.token,
     notification: {

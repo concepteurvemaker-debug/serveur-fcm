@@ -3,6 +3,7 @@ console.log("ENV FIREBASE:", !!process.env.FIREBASE_KEY);
 
 const express = require("express");
 const admin = require("firebase-admin");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
@@ -350,6 +351,10 @@ function distance(lat1, lon1, lat2, lon2) {
 
 app.get("/", (req, res) => {
   res.send("Serveur FCM OK");
+});
+
+app.get("/admin/dashboard", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin-dashboard.html"));
 });
 
 app.get("/auth-check", authenticateSecours, (req, res) => {

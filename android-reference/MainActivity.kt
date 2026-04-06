@@ -22,10 +22,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -34,6 +36,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.google.android.gms.location.FusedLocationProviderClient
@@ -81,6 +84,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var currentMode by mutableStateOf(AppMode.NONE)
     private var interventionActive by mutableStateOf(false)
     private var statusMessage by mutableStateOf("Choisis un mode.")
+    private var secoursEmailInput by mutableStateOf("")
+    private var secoursPasswordInput by mutableStateOf("")
+    private var secoursUserEmail by mutableStateOf<String?>(null)
+
+    private val firebaseAuth by lazy { FirebaseAuth.getInstance() }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -98,11 +106,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        refreshSecoursSession()
         currentMode = loadSavedMode()
         statusMessage = when (currentMode) {
             AppMode.NONE -> "Choisis un mode."
             AppMode.PUBLIC -> "Mode public restaure."
-            AppMode.SECOURS -> "Mode secours restaure. Intervention automatique sur mouvement."
+            AppMode.SECOURS -> {
+                if (isSecoursAuthenticated()) {
+                    "Mode secours restaure. Intervention automatique sur mouvement."
+                } else {
+                    "Connecte un compte secours pour utiliser ce mode."
+                }
+            }
         }
 
         requestNeededPermissions()
@@ -224,7 +239,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         currentMode = AppMode.SECOURS
         interventionActive = false
         saveMode(currentMode)
-        statusMessage = "Mode secours pret. Mouvement ou bouton pour lancer l'intervention."
+        statusMessage = if (isSecoursAuthenticated()) {
+            "Mode secours pret. Mouvement ou bouton pour lancer l'intervention."
+        } else {
+            "Connecte un compte secours pour continuer."
+        }
         refreshTracking()
     }
 
@@ -239,6 +258,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun toggleIntervention() {
         if (currentMode != AppMode.SECOURS) {
+            return
+        }
+
+        if (!isSecoursAuthenticated()) {
+            statusMessage = "Connexion secours requise."
             return
         }
 
@@ -284,7 +308,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 )
             }
             AppMode.SECOURS -> {
-                if (interventionActive) {
+                if (!isSecoursAuthenticated()) {
+                    stopSecoursForegroundService()
+                } else if (interventionActive) {
                     startSecoursForegroundService()
                 } else {
                     stopSecoursForegroundService()
@@ -315,6 +341,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private fun startSecoursForegroundService() {
         val token = fcmToken ?: return
+
+        if (!isSecoursAuthenticated()) {
+            statusMessage = "Connexion secours requise."
+            return
+        }
 
         val intent = Intent(this, LocationForegroundService::class.java).apply {
             action = LocationForegroundService.ACTION_START
@@ -423,6 +454,11 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun sendManualAlert() {
+        if (!isSecoursAuthenticated()) {
+            statusMessage = "Connexion secours requise."
+            return
+        }
+
         val location = lastLiveLocation
 
         if (location == null) {
@@ -446,7 +482,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         onSuccess: (String) -> Unit,
         onError: (Exception?) -> Unit,
     ) {
-        val user = FirebaseAuth.getInstance().currentUser
+        val user = firebaseAuth.currentUser
 
         if (user == null) {
             onError(IllegalStateException("Aucun utilisateur secours connecte"))
@@ -473,7 +509,22 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         payload: JSONObject,
         logTag: String,
     ) {
+        sendSecoursJsonWithToken(
+            path = path,
+            payload = payload,
+            logTag = logTag,
+            forceRefresh = false,
+        )
+    }
+
+    private fun sendSecoursJsonWithToken(
+        path: String,
+        payload: JSONObject,
+        logTag: String,
+        forceRefresh: Boolean,
+    ) {
         fetchSecoursIdToken(
+            forceRefresh = forceRefresh,
             onSuccess = { idToken ->
                 val requestBody = payload.toString()
                     .toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -491,16 +542,26 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
                     override fun onResponse(call: Call, response: Response) {
                         response.use {
+                            val statusCode = it.code
                             val responseBody = it.body?.string().orEmpty()
-                            Log.d(logTag, "HTTP ${it.code}: $responseBody")
+                            Log.d(logTag, "HTTP $statusCode: $responseBody")
 
-                            if (it.isSuccessful) {
-                                runOnUiThread {
-                                    statusMessage = if (path == "/alert") {
-                                        "Alerte immediate envoyee."
-                                    } else {
-                                        "Position secours envoyee."
-                                    }
+                            if ((statusCode == 401 || statusCode == 403) && !forceRefresh) {
+                                sendSecoursJsonWithToken(
+                                    path = path,
+                                    payload = payload,
+                                    logTag = logTag,
+                                    forceRefresh = true,
+                                )
+                                return@use
+                            }
+
+                            runOnUiThread {
+                                statusMessage = when {
+                                    it.isSuccessful && path == "/alert" -> "Alerte immediate envoyee."
+                                    it.isSuccessful -> "Position secours envoyee."
+                                    statusCode == 401 || statusCode == 403 -> "Compte secours non autorise."
+                                    else -> "Erreur serveur secours."
                                 }
                             }
                         }
@@ -514,6 +575,66 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 }
             },
         )
+    }
+
+    private fun isSecoursAuthenticated(): Boolean = firebaseAuth.currentUser != null
+
+    private fun refreshSecoursSession() {
+        val currentUser = firebaseAuth.currentUser
+        secoursUserEmail = currentUser?.email
+
+        if (currentUser?.email != null && secoursEmailInput.isBlank()) {
+            secoursEmailInput = currentUser.email.orEmpty()
+        }
+
+        if (currentUser != null) {
+            secoursPasswordInput = ""
+        }
+    }
+
+    private fun signInSecours() {
+        val email = secoursEmailInput.trim()
+        val password = secoursPasswordInput
+
+        if (email.isBlank() || password.isBlank()) {
+            statusMessage = "Entre l'email et le mot de passe secours."
+            return
+        }
+
+        statusMessage = "Connexion secours en cours..."
+
+        firebaseAuth.signInWithEmailAndPassword(email, password)
+            .addOnSuccessListener {
+                refreshSecoursSession()
+                fetchSecoursIdToken(
+                    forceRefresh = true,
+                    onSuccess = {
+                        runOnUiThread {
+                            statusMessage = "Compte secours connecte."
+                            refreshTracking()
+                        }
+                    },
+                    onError = { error ->
+                        Log.e("AUTH", "Impossible d'actualiser le token secours", error)
+                        runOnUiThread {
+                            statusMessage = "Compte connecte, mais token secours indisponible."
+                        }
+                    },
+                )
+            }
+            .addOnFailureListener { error ->
+                Log.e("AUTH", "Echec connexion secours", error)
+                statusMessage = "Connexion secours impossible."
+            }
+    }
+
+    private fun signOutSecours() {
+        firebaseAuth.signOut()
+        refreshSecoursSession()
+        interventionActive = false
+        stopSecoursForegroundService()
+        statusMessage = "Compte secours deconnecte."
+        refreshTracking()
     }
 
     private fun postJson(
@@ -605,6 +726,50 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     @Composable
     private fun SecoursScreen() {
+        val connectedEmail = secoursUserEmail
+
+        if (connectedEmail == null) {
+            Text("Connexion secours requise pour ce mode.")
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedTextField(
+                value = secoursEmailInput,
+                onValueChange = { secoursEmailInput = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Email secours") },
+                singleLine = true,
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            OutlinedTextField(
+                value = secoursPasswordInput,
+                onValueChange = { secoursPasswordInput = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Mot de passe") },
+                singleLine = true,
+                visualTransformation = PasswordVisualTransformation(),
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(onClick = { signInSecours() }) {
+                Text("Se connecter")
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(onClick = { returnToHome() }) {
+                Text("Menu principal")
+            }
+            return
+        }
+
+        Text("Compte secours : $connectedEmail")
+
+        Spacer(modifier = Modifier.height(16.dp))
+
         Text(
             if (interventionActive) {
                 "Intervention en cours"
@@ -627,8 +792,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
         Spacer(modifier = Modifier.height(16.dp))
 
+        Button(onClick = { signOutSecours() }) {
+            Text("Se deconnecter")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
         Button(onClick = { returnToHome() }) {
-            Text("Retour")
+            Text("Menu principal")
         }
     }
 }

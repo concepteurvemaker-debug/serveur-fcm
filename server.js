@@ -17,10 +17,20 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
+const db = admin.firestore();
+
+const COLLECTIONS = {
+  publicUsers: "publicUsers",
+  secoursVehicles: "secoursVehicles",
+  alertLogs: "alertLogs",
+};
+
 const ALERT_RADIUS_METERS = 150;
 const USER_TTL_MS = 60_000;
 const SECOURS_TTL_MS = 15_000;
 const NOTIFICATION_COOLDOWN_MS = 30_000;
+const FIRESTORE_CLEANUP_INTERVAL_MS = 60_000;
+const MAX_LOG_RECIPIENTS = 50;
 const REQUIRE_SECOURS_AUTH = process.env.REQUIRE_SECOURS_AUTH !== "false";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 const TOKEN_ERRORS_TO_PRUNE = new Set([
@@ -40,9 +50,8 @@ const SECOURS_EMAIL_DOMAINS = new Set(
     .filter(Boolean),
 );
 
-let users = [];
-let secoursVehicles = [];
 const notificationCooldowns = new Map();
+let lastFirestoreCleanupAt = 0;
 
 function toFiniteNumber(value) {
   const parsed = Number(value);
@@ -67,30 +76,12 @@ function isValidCoordinate(lat, lng) {
   );
 }
 
-function cleanupInactiveEntries() {
-  const now = Date.now();
-
-  users = users.filter((user) => now - user.lastUpdate < USER_TTL_MS);
-  secoursVehicles = secoursVehicles.filter(
-    (vehicle) => now - vehicle.lastUpdate < SECOURS_TTL_MS,
-  );
-
-  for (const [key, lastSentAt] of notificationCooldowns.entries()) {
-    if (now - lastSentAt > NOTIFICATION_COOLDOWN_MS * 3) {
-      notificationCooldowns.delete(key);
-    }
-  }
-}
-
-function extractBearerToken(req) {
-  const authHeader = req.headers.authorization || "";
-
-  if (!authHeader.startsWith("Bearer ")) {
-    return null;
-  }
-
-  const idToken = authHeader.slice("Bearer ".length).trim();
-  return idToken || null;
+function buildDocId(value) {
+  return Buffer.from(String(value), "utf8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
 }
 
 function normalizeEmail(email) {
@@ -116,6 +107,17 @@ function isAllowedSecoursEmail(email) {
   return domain ? SECOURS_EMAIL_DOMAINS.has(domain) : false;
 }
 
+function extractBearerToken(req) {
+  const authHeader = req.headers.authorization || "";
+
+  if (!authHeader.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const idToken = authHeader.slice("Bearer ".length).trim();
+  return idToken || null;
+}
+
 function isAuthorizedSecours(decodedToken) {
   return (
     decodedToken.secours === true ||
@@ -123,6 +125,126 @@ function isAuthorizedSecours(decodedToken) {
     decodedToken.role === "secours" ||
     SECOURS_UIDS.has(decodedToken.uid)
   );
+}
+
+function cleanupCooldowns(now = Date.now()) {
+  for (const [key, lastSentAt] of notificationCooldowns.entries()) {
+    if (now - lastSentAt > NOTIFICATION_COOLDOWN_MS * 3) {
+      notificationCooldowns.delete(key);
+    }
+  }
+}
+
+async function pruneStaleDocuments(collectionName, ttlMs, now = Date.now()) {
+  const threshold = now - ttlMs;
+
+  while (true) {
+    const snapshot = await db
+      .collection(collectionName)
+      .where("lastUpdate", "<", threshold)
+      .limit(200)
+      .get();
+
+    if (snapshot.empty) {
+      return;
+    }
+
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    if (snapshot.size < 200) {
+      return;
+    }
+  }
+}
+
+async function cleanupInactiveEntries({ force = false } = {}) {
+  const now = Date.now();
+  cleanupCooldowns(now);
+
+  if (!force && now - lastFirestoreCleanupAt < FIRESTORE_CLEANUP_INTERVAL_MS) {
+    return;
+  }
+
+  const results = await Promise.allSettled([
+    pruneStaleDocuments(COLLECTIONS.publicUsers, USER_TTL_MS, now),
+    pruneStaleDocuments(COLLECTIONS.secoursVehicles, SECOURS_TTL_MS, now),
+  ]);
+
+  results.forEach((result, index) => {
+    if (result.status === "rejected") {
+      const target =
+        index === 0 ? COLLECTIONS.publicUsers : COLLECTIONS.secoursVehicles;
+      console.error(`Erreur cleanup Firestore ${target}:`, result.reason);
+    }
+  });
+
+  lastFirestoreCleanupAt = now;
+}
+
+async function upsertPublicUser({ token, lat, lng, modePublic }) {
+  const docId = buildDocId(token);
+
+  await db.collection(COLLECTIONS.publicUsers).doc(docId).set(
+    {
+      token,
+      tokenId: docId,
+      lat,
+      lng,
+      modePublic,
+      lastUpdate: Date.now(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+
+async function upsertSecoursVehicle({ token, lat, lng, authUser }) {
+  const docId = buildDocId(token);
+
+  await db.collection(COLLECTIONS.secoursVehicles).doc(docId).set(
+    {
+      token,
+      tokenId: docId,
+      uid: authUser?.uid || null,
+      email: authUser?.email || null,
+      lat,
+      lng,
+      lastUpdate: Date.now(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+}
+
+async function removePublicUserByToken(token) {
+  await db
+    .collection(COLLECTIONS.publicUsers)
+    .doc(buildDocId(token))
+    .delete();
+}
+
+async function listActivePublicUsers() {
+  const threshold = Date.now() - USER_TTL_MS;
+  const snapshot = await db
+    .collection(COLLECTIONS.publicUsers)
+    .where("lastUpdate", ">=", threshold)
+    .get();
+
+  return snapshot.docs
+    .map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }))
+    .filter((user) => user.modePublic === true);
+}
+
+async function writeAlertLog(entry) {
+  await db.collection(COLLECTIONS.alertLogs).add({
+    ...entry,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
 }
 
 async function authenticateSecours(req, res, next) {
@@ -238,6 +360,43 @@ app.get("/auth-check", authenticateSecours, (req, res) => {
   });
 });
 
+app.get("/debug/firestore", requireAdminSecret, async (req, res) => {
+  try {
+    const [publicUsersSnapshot, secoursVehiclesSnapshot, alertLogsSnapshot] =
+      await Promise.all([
+        db.collection(COLLECTIONS.publicUsers).limit(20).get(),
+        db.collection(COLLECTIONS.secoursVehicles).limit(20).get(),
+        db.collection(COLLECTIONS.alertLogs).limit(20).get(),
+      ]);
+
+    return res.json({
+      ok: true,
+      firebaseProjectId: serviceAccount.project_id || null,
+      collections: {
+        publicUsers: {
+          count: publicUsersSnapshot.size,
+          ids: publicUsersSnapshot.docs.map((doc) => doc.id),
+        },
+        secoursVehicles: {
+          count: secoursVehiclesSnapshot.size,
+          ids: secoursVehiclesSnapshot.docs.map((doc) => doc.id),
+        },
+        alertLogs: {
+          count: alertLogsSnapshot.size,
+          ids: alertLogsSnapshot.docs.map((doc) => doc.id),
+        },
+      },
+    });
+  } catch (error) {
+    console.error("Erreur debug/firestore:", error);
+    return res.status(500).json({
+      ok: false,
+      message: "Impossible de lire Firestore",
+      error: error.message,
+    });
+  }
+});
+
 app.post("/grant-secours-access", requireAdminSecret, async (req, res) => {
   const { uid, email } = req.body || {};
 
@@ -284,7 +443,7 @@ app.post("/revoke-secours-access", requireAdminSecret, async (req, res) => {
   }
 });
 
-app.post("/register-user", (req, res) => {
+app.post("/register-user", async (req, res) => {
   const { token } = req.body;
   const modePublic = Boolean(req.body.modePublic);
   const { lat, lng } = parseCoordinates(req.body);
@@ -293,25 +452,16 @@ app.post("/register-user", (req, res) => {
     return res.status(400).send("Donnees utilisateur invalides");
   }
 
-  cleanupInactiveEntries();
+  try {
+    await cleanupInactiveEntries();
+    await upsertPublicUser({ token, lat, lng, modePublic });
 
-  const index = users.findIndex((user) => user.token === token);
-  const payload = {
-    token,
-    lat,
-    lng,
-    modePublic,
-    lastUpdate: Date.now(),
-  };
-
-  if (index >= 0) {
-    users[index] = payload;
-  } else {
-    users.push(payload);
+    console.log("User updated:", { token, lat, lng, modePublic });
+    return res.send("Utilisateur enregistre ou mis a jour");
+  } catch (error) {
+    console.error("Erreur register-user:", error);
+    return res.status(500).send("Erreur lors de l'enregistrement utilisateur");
   }
-
-  console.log("User updated:", { token, lat, lng, modePublic });
-  return res.send("Utilisateur enregistre ou mis a jour");
 });
 
 app.post("/update-position", authenticateSecours, async (req, res) => {
@@ -322,35 +472,30 @@ app.post("/update-position", authenticateSecours, async (req, res) => {
     return res.status(400).send("Donnees secours invalides");
   }
 
-  cleanupInactiveEntries();
-
-  const index = secoursVehicles.findIndex((vehicle) => vehicle.token === token);
-  const payload = {
-    token,
-    lat,
-    lng,
-    lastUpdate: Date.now(),
-  };
-
-  if (index >= 0) {
-    secoursVehicles[index] = payload;
-  } else {
-    secoursVehicles.push(payload);
-  }
-
-  console.log("Secours updated:", {
-    uid: req.authUser.uid,
-    email: req.authUser.email,
-    token,
-    lat,
-    lng,
-  });
-
   try {
+    await cleanupInactiveEntries();
+    await upsertSecoursVehicle({
+      token,
+      lat,
+      lng,
+      authUser: req.authUser,
+    });
+
+    console.log("Secours updated:", {
+      uid: req.authUser.uid,
+      email: req.authUser.email,
+      token,
+      lat,
+      lng,
+    });
+
     const result = await sendNearbyNotifications({
       lat,
       lng,
       sourceId: req.authUser.uid,
+      sourceType: "position_update",
+      sourceToken: token,
+      authUser: req.authUser,
       bypassCooldown: false,
     });
 
@@ -380,6 +525,9 @@ app.post("/alert", authenticateSecours, async (req, res) => {
       lat,
       lng,
       sourceId: `${req.authUser.uid}-manual-${Date.now()}`,
+      sourceType: "manual_alert",
+      sourceToken: null,
+      authUser: req.authUser,
       bypassCooldown: true,
     });
 
@@ -390,21 +538,23 @@ app.post("/alert", authenticateSecours, async (req, res) => {
   }
 });
 
-async function sendNearbyNotifications({ lat, lng, sourceId, bypassCooldown }) {
-  cleanupInactiveEntries();
+async function sendNearbyNotifications({
+  lat,
+  lng,
+  sourceId,
+  sourceType,
+  sourceToken,
+  authUser,
+  bypassCooldown,
+}) {
+  await cleanupInactiveEntries();
 
   const now = Date.now();
+  const activeUsers = await listActivePublicUsers();
   const messages = [];
+  const recipientSummaries = [];
 
-  for (const user of users) {
-    if (!user.modePublic) {
-      continue;
-    }
-
-    if (now - user.lastUpdate > USER_TTL_MS) {
-      continue;
-    }
-
+  for (const user of activeUsers) {
     const userDistance = distance(lat, lng, user.lat, user.lng);
     console.log("Distance check:", {
       userToken: user.token,
@@ -440,15 +590,47 @@ async function sendNearbyNotifications({ lat, lng, sourceId, bypassCooldown }) {
       },
     });
 
+    recipientSummaries.push({
+      userId: user.id,
+      distanceMeters: Math.round(userDistance),
+    });
+
     notificationCooldowns.set(cooldownKey, now);
   }
 
   if (messages.length === 0) {
     console.log("Aucun usager a proximite pour notification");
+
+    await writeAlertLog({
+      sourceId,
+      sourceType,
+      sourceTokenId: sourceToken ? buildDocId(sourceToken) : null,
+      initiatorUid: authUser?.uid || null,
+      initiatorEmail: authUser?.email || null,
+      lat,
+      lng,
+      bypassCooldown,
+      candidateUserCount: activeUsers.length,
+      notifiedUserCount: 0,
+      successCount: 0,
+      failureCount: 0,
+      outcome: "no_recipients",
+      recipients: [],
+      eventTimestampMs: now,
+    });
+
     return 0;
   }
 
   const response = await admin.messaging().sendEach(messages);
+  const failedDeletes = [];
+  const loggedRecipients = recipientSummaries
+    .slice(0, MAX_LOG_RECIPIENTS)
+    .map((recipient, index) => ({
+      ...recipient,
+      sent: Boolean(response.responses[index]?.success),
+      errorCode: response.responses[index]?.error?.code || null,
+    }));
 
   response.responses.forEach((item, index) => {
     if (item.success) {
@@ -461,8 +643,33 @@ async function sendNearbyNotifications({ lat, lng, sourceId, bypassCooldown }) {
     console.error(`Erreur envoi token ${failedToken}:`, item.error);
 
     if (TOKEN_ERRORS_TO_PRUNE.has(errorCode)) {
-      users = users.filter((user) => user.token !== failedToken);
+      failedDeletes.push(removePublicUserByToken(failedToken));
     }
+  });
+
+  const deleteResults = await Promise.allSettled(failedDeletes);
+  deleteResults.forEach((result) => {
+    if (result.status === "rejected") {
+      console.error("Erreur suppression token public invalide:", result.reason);
+    }
+  });
+
+  await writeAlertLog({
+    sourceId,
+    sourceType,
+    sourceTokenId: sourceToken ? buildDocId(sourceToken) : null,
+    initiatorUid: authUser?.uid || null,
+    initiatorEmail: authUser?.email || null,
+    lat,
+    lng,
+    bypassCooldown,
+    candidateUserCount: activeUsers.length,
+    notifiedUserCount: messages.length,
+    successCount: response.successCount,
+    failureCount: response.failureCount,
+    outcome: response.failureCount > 0 ? "partial" : "sent",
+    recipients: loggedRecipients,
+    eventTimestampMs: now,
   });
 
   console.log("Notifications envoyees:", response.successCount);
@@ -470,7 +677,9 @@ async function sendNearbyNotifications({ lat, lng, sourceId, bypassCooldown }) {
 }
 
 setInterval(() => {
-  cleanupInactiveEntries();
+  cleanupInactiveEntries().catch((error) => {
+    console.error("Erreur cleanup periodique Firestore:", error);
+  });
 }, 10_000);
 
 const PORT = process.env.PORT || 3000;

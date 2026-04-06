@@ -22,6 +22,7 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.firebase.auth.FirebaseAuth
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType.Companion.toMediaType
@@ -186,31 +187,51 @@ class LocationForegroundService : Service() {
 
     private fun sendSecoursPosition(lat: Double, lng: Double) {
         val token = fcmToken ?: return
+        val firebaseUser = FirebaseAuth.getInstance().currentUser
 
-        val payload = JSONObject()
-            .put("token", token)
-            .put("lat", lat)
-            .put("lng", lng)
+        if (firebaseUser == null) {
+            Log.e("FGS", "Aucun compte secours connecte")
+            return
+        }
 
-        val requestBody = payload.toString()
-            .toRequestBody("application/json; charset=utf-8".toMediaType())
+        firebaseUser.getIdToken(false)
+            .addOnSuccessListener { result ->
+                val idToken = result.token
 
-        val request = Request.Builder()
-            .url(serverBaseUrl + "/update-position")
-            .post(requestBody)
-            .build()
-
-        httpClient.newCall(request).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                Log.e("FGS", "Erreur reseau secours", e)
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                response.use {
-                    Log.d("FGS", "HTTP ${it.code}: ${it.body?.string().orEmpty()}")
+                if (idToken.isNullOrBlank()) {
+                    Log.e("FGS", "Firebase ID token vide")
+                    return@addOnSuccessListener
                 }
+
+                val payload = JSONObject()
+                    .put("token", token)
+                    .put("lat", lat)
+                    .put("lng", lng)
+
+                val requestBody = payload.toString()
+                    .toRequestBody("application/json; charset=utf-8".toMediaType())
+
+                val request = Request.Builder()
+                    .url(serverBaseUrl + "/update-position")
+                    .addHeader("Authorization", "Bearer $idToken")
+                    .post(requestBody)
+                    .build()
+
+                httpClient.newCall(request).enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        Log.e("FGS", "Erreur reseau secours", e)
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        response.use {
+                            Log.d("FGS", "HTTP ${it.code}: ${it.body?.string().orEmpty()}")
+                        }
+                    }
+                })
             }
-        })
+            .addOnFailureListener { error ->
+                Log.e("FGS", "Impossible de recuperer le token secours", error)
+            }
     }
 
     companion object {

@@ -21,10 +21,24 @@ const ALERT_RADIUS_METERS = 150;
 const USER_TTL_MS = 60_000;
 const SECOURS_TTL_MS = 15_000;
 const NOTIFICATION_COOLDOWN_MS = 30_000;
+const REQUIRE_SECOURS_AUTH = process.env.REQUIRE_SECOURS_AUTH !== "false";
+const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
 const TOKEN_ERRORS_TO_PRUNE = new Set([
   "messaging/invalid-registration-token",
   "messaging/registration-token-not-registered",
 ]);
+const SECOURS_UIDS = new Set(
+  (process.env.SECOURS_UIDS || "")
+    .split(",")
+    .map((uid) => uid.trim())
+    .filter(Boolean),
+);
+const SECOURS_EMAIL_DOMAINS = new Set(
+  (process.env.SECOURS_EMAIL_DOMAINS || "")
+    .split(",")
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean),
+);
 
 let users = [];
 let secoursVehicles = [];
@@ -68,6 +82,135 @@ function cleanupInactiveEntries() {
   }
 }
 
+function extractBearerToken(req) {
+  const authHeader = req.headers.authorization || "";
+
+  if (!authHeader.startsWith("Bearer ")) {
+    return null;
+  }
+
+  const idToken = authHeader.slice("Bearer ".length).trim();
+  return idToken || null;
+}
+
+function normalizeEmail(email) {
+  return typeof email === "string" ? email.trim().toLowerCase() : null;
+}
+
+function getEmailDomain(email) {
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!normalizedEmail || !normalizedEmail.includes("@")) {
+    return null;
+  }
+
+  return normalizedEmail.split("@").pop();
+}
+
+function isAllowedSecoursEmail(email) {
+  if (SECOURS_EMAIL_DOMAINS.size === 0) {
+    return true;
+  }
+
+  const domain = getEmailDomain(email);
+  return domain ? SECOURS_EMAIL_DOMAINS.has(domain) : false;
+}
+
+function isAuthorizedSecours(decodedToken) {
+  return (
+    decodedToken.secours === true ||
+    decodedToken.admin === true ||
+    decodedToken.role === "secours" ||
+    SECOURS_UIDS.has(decodedToken.uid)
+  );
+}
+
+async function authenticateSecours(req, res, next) {
+  if (!REQUIRE_SECOURS_AUTH) {
+    req.authUser = { uid: "dev-insecure", email: null };
+    return next();
+  }
+
+  const idToken = extractBearerToken(req);
+
+  if (!idToken) {
+    return res.status(401).send("Authorization Bearer token requis");
+  }
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+
+    if (!isAuthorizedSecours(decodedToken)) {
+      return res.status(403).send("Compte secours non autorise");
+    }
+
+    req.authUser = {
+      uid: decodedToken.uid,
+      email: decodedToken.email || null,
+    };
+
+    return next();
+  } catch (error) {
+    console.error("Erreur auth secours:", error);
+    return res.status(401).send("Token Firebase invalide");
+  }
+}
+
+function requireAdminSecret(req, res, next) {
+  if (!ADMIN_SECRET) {
+    return res.status(503).send("ADMIN_SECRET non configure");
+  }
+
+  const providedSecret = req.headers["x-admin-secret"];
+
+  if (providedSecret !== ADMIN_SECRET) {
+    return res.status(401).send("Secret administrateur invalide");
+  }
+
+  return next();
+}
+
+async function resolveFirebaseUser({ uid, email }) {
+  if (uid) {
+    return admin.auth().getUser(uid);
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+
+  if (normalizedEmail) {
+    return admin.auth().getUserByEmail(normalizedEmail);
+  }
+
+  throw new Error("uid ou email requis");
+}
+
+async function setSecoursClaim({ uid, email, enabled }) {
+  const userRecord = await resolveFirebaseUser({ uid, email });
+  const userEmail = normalizeEmail(userRecord.email);
+
+  if (enabled && !isAllowedSecoursEmail(userEmail)) {
+    throw new Error("email_secours_non_autorise");
+  }
+
+  const currentClaims = userRecord.customClaims || {};
+  const nextClaims = { ...currentClaims };
+
+  if (enabled) {
+    nextClaims.secours = true;
+  } else {
+    delete nextClaims.secours;
+  }
+
+  await admin.auth().setCustomUserClaims(userRecord.uid, nextClaims);
+
+  return {
+    uid: userRecord.uid,
+    email: userEmail,
+    secours: enabled,
+    claims: nextClaims,
+  };
+}
+
 function distance(lat1, lon1, lat2, lon2) {
   const earthRadiusMeters = 6371e3;
   const phi1 = (lat1 * Math.PI) / 180;
@@ -85,6 +228,60 @@ function distance(lat1, lon1, lat2, lon2) {
 
 app.get("/", (req, res) => {
   res.send("Serveur FCM OK");
+});
+
+app.get("/auth-check", authenticateSecours, (req, res) => {
+  res.json({
+    ok: true,
+    uid: req.authUser.uid,
+    email: req.authUser.email,
+  });
+});
+
+app.post("/grant-secours-access", requireAdminSecret, async (req, res) => {
+  const { uid, email } = req.body || {};
+
+  try {
+    const result = await setSecoursClaim({
+      uid,
+      email,
+      enabled: true,
+    });
+
+    return res.json({
+      ok: true,
+      message: "Acces secours accorde",
+      ...result,
+    });
+  } catch (error) {
+    if (error.message === "email_secours_non_autorise") {
+      return res.status(403).send("Email non autorise pour le role secours");
+    }
+
+    console.error("Erreur grant-secours-access:", error);
+    return res.status(400).send("Impossible d'accorder l'acces secours");
+  }
+});
+
+app.post("/revoke-secours-access", requireAdminSecret, async (req, res) => {
+  const { uid, email } = req.body || {};
+
+  try {
+    const result = await setSecoursClaim({
+      uid,
+      email,
+      enabled: false,
+    });
+
+    return res.json({
+      ok: true,
+      message: "Acces secours retire",
+      ...result,
+    });
+  } catch (error) {
+    console.error("Erreur revoke-secours-access:", error);
+    return res.status(400).send("Impossible de retirer l'acces secours");
+  }
 });
 
 app.post("/register-user", (req, res) => {
@@ -117,7 +314,7 @@ app.post("/register-user", (req, res) => {
   return res.send("Utilisateur enregistre ou mis a jour");
 });
 
-app.post("/update-position", async (req, res) => {
+app.post("/update-position", authenticateSecours, async (req, res) => {
   const { token } = req.body;
   const { lat, lng } = parseCoordinates(req.body);
 
@@ -141,13 +338,19 @@ app.post("/update-position", async (req, res) => {
     secoursVehicles.push(payload);
   }
 
-  console.log("Secours updated:", { token, lat, lng });
+  console.log("Secours updated:", {
+    uid: req.authUser.uid,
+    email: req.authUser.email,
+    token,
+    lat,
+    lng,
+  });
 
   try {
     const result = await sendNearbyNotifications({
       lat,
       lng,
-      sourceId: token,
+      sourceId: req.authUser.uid,
       bypassCooldown: false,
     });
 
@@ -158,20 +361,25 @@ app.post("/update-position", async (req, res) => {
   }
 });
 
-app.post("/alert", async (req, res) => {
+app.post("/alert", authenticateSecours, async (req, res) => {
   const { lat, lng } = parseCoordinates(req.body);
 
   if (!isValidCoordinate(lat, lng)) {
     return res.status(400).send("Position invalide");
   }
 
-  console.log("Manual alert:", { lat, lng });
+  console.log("Manual alert:", {
+    uid: req.authUser.uid,
+    email: req.authUser.email,
+    lat,
+    lng,
+  });
 
   try {
     const result = await sendNearbyNotifications({
       lat,
       lng,
-      sourceId: `manual-${Date.now()}`,
+      sourceId: `${req.authUser.uid}-manual-${Date.now()}`,
       bypassCooldown: true,
     });
 

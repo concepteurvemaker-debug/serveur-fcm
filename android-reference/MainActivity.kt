@@ -42,6 +42,7 @@ import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.messaging.FirebaseMessaging
 import okhttp3.Call
 import okhttp3.Callback
@@ -414,11 +415,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             .put("lat", location.latitude)
             .put("lng", location.longitude)
 
-        postJson(
+        postSecoursJson(
             path = "/update-position",
             payload = payload,
             logTag = "SECOURS",
-            successMessage = "Position secours envoyee.",
         )
     }
 
@@ -434,11 +434,85 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             .put("lat", location.latitude)
             .put("lng", location.longitude)
 
-        postJson(
+        postSecoursJson(
             path = "/alert",
             payload = payload,
             logTag = "ALERTE",
-            successMessage = "Alerte immediate envoyee.",
+        )
+    }
+
+    private fun fetchSecoursIdToken(
+        forceRefresh: Boolean = false,
+        onSuccess: (String) -> Unit,
+        onError: (Exception?) -> Unit,
+    ) {
+        val user = FirebaseAuth.getInstance().currentUser
+
+        if (user == null) {
+            onError(IllegalStateException("Aucun utilisateur secours connecte"))
+            return
+        }
+
+        user.getIdToken(forceRefresh)
+            .addOnSuccessListener { result ->
+                val idToken = result.token
+
+                if (idToken.isNullOrBlank()) {
+                    onError(IllegalStateException("Firebase ID token vide"))
+                } else {
+                    onSuccess(idToken)
+                }
+            }
+            .addOnFailureListener { error ->
+                onError(error)
+            }
+    }
+
+    private fun postSecoursJson(
+        path: String,
+        payload: JSONObject,
+        logTag: String,
+    ) {
+        fetchSecoursIdToken(
+            onSuccess = { idToken ->
+                val requestBody = payload.toString()
+                    .toRequestBody("application/json; charset=utf-8".toMediaType())
+
+                val request = Request.Builder()
+                    .url(serverBaseUrl + path)
+                    .addHeader("Authorization", "Bearer $idToken")
+                    .post(requestBody)
+                    .build()
+
+                httpClient.newCall(request).enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        Log.e(logTag, "Erreur reseau", e)
+                    }
+
+                    override fun onResponse(call: Call, response: Response) {
+                        response.use {
+                            val responseBody = it.body?.string().orEmpty()
+                            Log.d(logTag, "HTTP ${it.code}: $responseBody")
+
+                            if (it.isSuccessful) {
+                                runOnUiThread {
+                                    statusMessage = if (path == "/alert") {
+                                        "Alerte immediate envoyee."
+                                    } else {
+                                        "Position secours envoyee."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })
+            },
+            onError = { error ->
+                Log.e(logTag, "Impossible de recuperer le token secours", error)
+                runOnUiThread {
+                    statusMessage = "Connexion secours requise."
+                }
+            },
         )
     }
 

@@ -397,6 +397,106 @@ app.get("/debug/firestore", requireAdminSecret, async (req, res) => {
   }
 });
 
+app.get("/admin/alert-logs", requireAdminSecret, async (req, res) => {
+  const parsedLimit = Number(req.query.limit);
+  const limit =
+    Number.isFinite(parsedLimit) && parsedLimit > 0
+      ? Math.min(Math.floor(parsedLimit), 100)
+      : 20;
+
+  try {
+    const snapshot = await db
+      .collection(COLLECTIONS.alertLogs)
+      .orderBy("eventTimestampMs", "desc")
+      .limit(limit)
+      .get();
+
+    return res.json({
+      ok: true,
+      count: snapshot.size,
+      logs: snapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      })),
+    });
+  } catch (error) {
+    console.error("Erreur admin/alert-logs:", error);
+    return res.status(500).json({
+      ok: false,
+      message: "Impossible de lire les alertes",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/admin/public-users", requireAdminSecret, async (req, res) => {
+  try {
+    const users = await listActivePublicUsers();
+
+    return res.json({
+      ok: true,
+      count: users.length,
+      users: users
+        .sort((a, b) => (b.lastUpdate || 0) - (a.lastUpdate || 0))
+        .map((user) => ({
+          id: user.id,
+          tokenId: user.tokenId || user.id,
+          lat: user.lat,
+          lng: user.lng,
+          modePublic: user.modePublic === true,
+          lastUpdate: user.lastUpdate || null,
+        })),
+    });
+  } catch (error) {
+    console.error("Erreur admin/public-users:", error);
+    return res.status(500).json({
+      ok: false,
+      message: "Impossible de lire les usagers publics",
+      error: error.message,
+    });
+  }
+});
+
+app.get("/admin/secours-vehicles", requireAdminSecret, async (req, res) => {
+  const threshold = Date.now() - SECOURS_TTL_MS;
+
+  try {
+    const snapshot = await db
+      .collection(COLLECTIONS.secoursVehicles)
+      .where("lastUpdate", ">=", threshold)
+      .get();
+
+    const vehicles = snapshot.docs
+      .map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+      }))
+      .sort((a, b) => (b.lastUpdate || 0) - (a.lastUpdate || 0))
+      .map((vehicle) => ({
+        id: vehicle.id,
+        tokenId: vehicle.tokenId || vehicle.id,
+        uid: vehicle.uid || null,
+        email: vehicle.email || null,
+        lat: vehicle.lat,
+        lng: vehicle.lng,
+        lastUpdate: vehicle.lastUpdate || null,
+      }));
+
+    return res.json({
+      ok: true,
+      count: vehicles.length,
+      vehicles,
+    });
+  } catch (error) {
+    console.error("Erreur admin/secours-vehicles:", error);
+    return res.status(500).json({
+      ok: false,
+      message: "Impossible de lire les vehicules secours",
+      error: error.message,
+    });
+  }
+});
+
 app.post("/grant-secours-access", requireAdminSecret, async (req, res) => {
   const { uid, email } = req.body || {};
 

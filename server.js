@@ -18,7 +18,7 @@ admin.initializeApp({
 });
 
 // Mets 150 en production. 1000 aide pour les tests.
-const ALERT_RADIUS_METERS = 1000;
+const ALERT_RADIUS_METERS = 150;
 const USER_TTL_MS = 60_000;
 const SECOURS_TTL_MS = 15_000;
 const NOTIFICATION_COOLDOWN_MS = 30_000;

@@ -7,7 +7,6 @@
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- A garder seulement si tu ajoutes un vrai ForegroundService de localisation -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
 
@@ -49,13 +48,10 @@
         </service>
         -->
 
-        <!-- A ajouter plus tard quand on passera le suivi secours en vrai service arriere-plan -->
-        <!--
         <service
             android:name=".LocationForegroundService"
             android:exported="false"
             android:foregroundServiceType="location" />
-        -->
 
     </application>
 </manifest>

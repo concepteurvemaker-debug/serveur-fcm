@@ -3,6 +3,7 @@ package com.example.secoursproximity
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -63,6 +64,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
     private val serverBaseUrl = "https://serveur-fcm.onrender.com"
     private val httpClient = OkHttpClient()
+    private val prefsName = "secours_proximity_prefs"
+    private val modeKey = "saved_mode"
 
     private lateinit var fusedLocationClient: FusedLocationProviderClient
     private lateinit var sensorManager: SensorManager
@@ -72,6 +75,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var fcmToken: String? = null
     private var lastLiveLocation: Location? = null
     private var lastMotionUpdateAt = 0L
+    private var lastAutoStartAt = 0L
 
     private var currentMode by mutableStateOf(AppMode.NONE)
     private var interventionActive by mutableStateOf(false)
@@ -93,6 +97,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+        currentMode = loadSavedMode()
+        statusMessage = when (currentMode) {
+            AppMode.NONE -> "Choisis un mode."
+            AppMode.PUBLIC -> "Mode public restaure."
+            AppMode.SECOURS -> "Mode secours restaure. Intervention automatique sur mouvement."
+        }
 
         requestNeededPermissions()
         fetchFcmToken()
@@ -124,7 +134,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (currentMode != AppMode.SECOURS || !interventionActive) {
+        if (currentMode != AppMode.SECOURS) {
             return
         }
 
@@ -134,9 +144,24 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val z = sensorEvent.values[2]
         val netAcceleration = sqrt(x * x + y * y + z * z) - SensorManager.GRAVITY_EARTH
 
+        if (!interventionActive &&
+            netAcceleration > 2.5f &&
+            System.currentTimeMillis() - lastAutoStartAt > 10_000
+        ) {
+            lastAutoStartAt = System.currentTimeMillis()
+            interventionActive = true
+            statusMessage = "Mouvement detecte. Intervention secours demarree automatiquement."
+            refreshTracking()
+            return
+        }
+
+        if (!interventionActive) {
+            return
+        }
+
         if (netAcceleration > 2.5f && System.currentTimeMillis() - lastMotionUpdateAt > 5_000) {
             lastMotionUpdateAt = System.currentTimeMillis()
-            lastLiveLocation?.let { sendSecoursPosition(it) }
+            statusMessage = "Mouvement secours detecte. Suivi arriere-plan actif."
         }
     }
 
@@ -189,6 +214,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun selectPublicMode() {
         currentMode = AppMode.PUBLIC
         interventionActive = false
+        saveMode(currentMode)
         statusMessage = "Mode public actif."
         refreshTracking()
     }
@@ -196,15 +222,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun selectSecoursMode() {
         currentMode = AppMode.SECOURS
         interventionActive = false
-        statusMessage = "Mode secours pret. Lance l'intervention."
+        saveMode(currentMode)
+        statusMessage = "Mode secours pret. Mouvement ou bouton pour lancer l'intervention."
         refreshTracking()
     }
 
     private fun returnToHome() {
         currentMode = AppMode.NONE
         interventionActive = false
+        saveMode(currentMode)
         statusMessage = "Choisis un mode."
         stopLocationTracking()
+        stopSecoursForegroundService()
     }
 
     private fun toggleIntervention() {
@@ -225,6 +254,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private fun refreshTracking() {
         stopLocationTracking()
 
+        if (currentMode != AppMode.SECOURS || !interventionActive) {
+            stopSecoursForegroundService()
+        }
+
         if (!hasLocationPermission()) {
             statusMessage = "La permission de localisation est requise."
             return
@@ -236,30 +269,67 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         }
 
         when (currentMode) {
-            AppMode.NONE -> Unit
-            AppMode.PUBLIC -> startLocationTracking(
-                priority = Priority.PRIORITY_BALANCED_POWER_ACCURACY,
-                intervalMs = 15_000L,
-                minDistanceMeters = 30f,
-                onLocation = { location ->
-                    registerPublicUser(location)
-                },
-            )
+            AppMode.NONE -> {
+                stopSecoursForegroundService()
+            }
+            AppMode.PUBLIC -> {
+                startLocationTracking(
+                    priority = Priority.PRIORITY_BALANCED_POWER_ACCURACY,
+                    intervalMs = 15_000L,
+                    minDistanceMeters = 30f,
+                    onLocation = { location ->
+                        registerPublicUser(location)
+                    },
+                )
+            }
             AppMode.SECOURS -> {
                 if (interventionActive) {
-                    startLocationTracking(
-                        priority = Priority.PRIORITY_HIGH_ACCURACY,
-                        intervalMs = 3_000L,
-                        minDistanceMeters = 10f,
-                        onLocation = { location ->
-                            sendSecoursPosition(location)
-                        },
-                    )
+                    startSecoursForegroundService()
+                } else {
+                    stopSecoursForegroundService()
                 }
             }
         }
 
         pushLastKnownLocation()
+    }
+
+    private fun saveMode(mode: AppMode) {
+        val prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(modeKey, mode.name)
+            .apply()
+    }
+
+    private fun loadSavedMode(): AppMode {
+        val prefs = getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+        val storedMode = prefs.getString(modeKey, AppMode.NONE.name) ?: AppMode.NONE.name
+
+        return try {
+            AppMode.valueOf(storedMode)
+        } catch (_: IllegalArgumentException) {
+            AppMode.NONE
+        }
+    }
+
+    private fun startSecoursForegroundService() {
+        val token = fcmToken ?: return
+
+        val intent = Intent(this, LocationForegroundService::class.java).apply {
+            action = LocationForegroundService.ACTION_START
+            putExtra(LocationForegroundService.EXTRA_SERVER_URL, serverBaseUrl)
+            putExtra(LocationForegroundService.EXTRA_FCM_TOKEN, token)
+        }
+
+        ContextCompat.startForegroundService(this, intent)
+    }
+
+    private fun stopSecoursForegroundService() {
+        val intent = Intent(this, LocationForegroundService::class.java).apply {
+            action = LocationForegroundService.ACTION_STOP
+        }
+
+        startService(intent)
     }
 
     @SuppressLint("MissingPermission")
@@ -312,7 +382,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
                 when {
                     currentMode == AppMode.PUBLIC -> registerPublicUser(location)
-                    currentMode == AppMode.SECOURS && interventionActive -> sendSecoursPosition(location)
                 }
             }
             .addOnFailureListener { error ->

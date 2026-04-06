@@ -17,7 +17,6 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// Mets 150 en production. 1000 aide pour les tests.
 const ALERT_RADIUS_METERS = 150;
 const USER_TTL_MS = 60_000;
 const SECOURS_TTL_MS = 15_000;
@@ -27,8 +26,8 @@ const TOKEN_ERRORS_TO_PRUNE = new Set([
   "messaging/registration-token-not-registered",
 ]);
 
-let users = []; // { token, lat, lng, modePublic, lastUpdate }
-let secoursVehicles = []; // { token, lat, lng, lastUpdate }
+let users = [];
+let secoursVehicles = [];
 const notificationCooldowns = new Map();
 
 function toFiniteNumber(value) {
@@ -221,14 +220,13 @@ async function sendNearbyNotifications({ lat, lng, sourceId, bypassCooldown }) {
 
     messages.push({
       token: user.token,
-      notification: {
-        title: "Service d'urgence a proximite",
-        body: "Un vehicule d'urgence approche dans un rayon de 150 m.",
+      android: {
+        priority: "high",
       },
       data: {
         type: "emergency_nearby",
         title: "Service d'urgence a proximite",
-        body: "Un vehicule d'urgence approche dans un rayon de 150 m.",
+        body: "Un vehicule d'urgence approche dans votre zone.",
         radiusMeters: String(ALERT_RADIUS_METERS),
         sourceId: String(sourceId),
       },

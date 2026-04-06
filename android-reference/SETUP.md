@@ -5,6 +5,8 @@ Manifest :
 - `android.permission.ACCESS_FINE_LOCATION`
 - `android.permission.ACCESS_COARSE_LOCATION`
 - `android.permission.POST_NOTIFICATIONS` (Android 13+)
+- `android.permission.FOREGROUND_SERVICE`
+- `android.permission.FOREGROUND_SERVICE_LOCATION`
 
 Service a declarer dans `AndroidManifest.xml` :
 
@@ -18,12 +20,22 @@ Service a declarer dans `AndroidManifest.xml` :
 </service>
 ```
 
+Service de suivi secours a declarer aussi :
+
+```xml
+<service
+    android:name=".LocationForegroundService"
+    android:exported="false"
+    android:foregroundServiceType="location" />
+```
+
 Dependances cote app :
 - Firebase Messaging
 - OkHttp
 - Google Play Services Location
 
 Notes :
-- Le `MainActivity` fourni fonctionne surtout quand l'app est ouverte.
-- Pour un vrai suivi en arriere-plan cote secours, il faudra ensuite passer sur un `ForegroundService`.
+- Le mode public continue d'etre gere par le `MainActivity`.
+- Le mode secours actif bascule sur `LocationForegroundService` et continue a envoyer la position en arriere-plan.
 - Le mode public doit aussi envoyer sa position au serveur, sinon le backend ne peut pas savoir qui est dans le rayon des 150 m.
+- Le service secours doit etre demarre pendant que l'app est au premier plan. Android ne permet pas de lancer librement un foreground service de localisation depuis une app completement fermee juste parce que le telephone bouge.

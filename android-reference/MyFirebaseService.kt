@@ -3,6 +3,8 @@ package com.example.secoursproximity
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.os.Build
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -47,12 +49,20 @@ class MyFirebaseService : FirebaseMessagingService() {
             return
         }
 
+        val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+        val audioAttributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+
         val channel = NotificationChannel(
             CHANNEL_ID,
             "Alertes secours",
             NotificationManager.IMPORTANCE_HIGH,
         ).apply {
             description = "Notifications de proximite des services de secours"
+            enableVibration(true)
+            setSound(soundUri, audioAttributes)
         }
 
         val manager =

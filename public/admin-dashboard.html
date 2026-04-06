@@ -4,6 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>SecoursProximity Admin</title>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+      crossorigin=""
+    />
     <style>
       :root {
         --bg: #f5f3eb;
@@ -171,6 +177,65 @@
         gap: 18px;
       }
 
+      .map-section {
+        padding: 20px;
+        margin-bottom: 18px;
+      }
+
+      .map-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 14px;
+      }
+
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+
+      .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: #efe7d6;
+        font-size: 0.88rem;
+        color: var(--ink);
+      }
+
+      .legend-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+
+      .legend-dot.public {
+        background: #0f766e;
+      }
+
+      .legend-dot.secours {
+        background: #b91c1c;
+      }
+
+      .map-status {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      #liveMap {
+        width: 100%;
+        min-height: 430px;
+        border-radius: 18px;
+        overflow: hidden;
+        border: 1px solid #d9d1c0;
+      }
+
       .section {
         padding: 20px;
         overflow: hidden;
@@ -331,6 +396,31 @@
         </article>
       </section>
 
+      <section class="section map-section">
+        <div class="map-toolbar">
+          <div>
+            <h2>Carte interactive</h2>
+            <p class="sub" style="margin-bottom: 0;">
+              Vue geographique en direct des publics et des secours actifs.
+            </p>
+          </div>
+          <div class="legend">
+            <div class="legend-item">
+              <span class="legend-dot public"></span>
+              Public
+            </div>
+            <div class="legend-item">
+              <span class="legend-dot secours"></span>
+              Secours
+            </div>
+          </div>
+        </div>
+        <div id="mapStatus" class="map-status">
+          La carte s'affichera apres le premier chargement.
+        </div>
+        <div id="liveMap" aria-label="Carte des positions actives"></div>
+      </section>
+
       <section class="content-grid">
         <article class="section">
           <h2>Usagers publics actifs</h2>
@@ -356,6 +446,11 @@
       </section>
     </main>
 
+    <script
+      src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+      integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+      crossorigin=""
+    ></script>
     <script>
       const STORAGE_KEY = "secoursproximity_admin_secret";
       const statusEl = document.getElementById("status");
@@ -370,8 +465,12 @@
       const publicUsersListEl = document.getElementById("publicUsersList");
       const secoursVehiclesListEl = document.getElementById("secoursVehiclesList");
       const alertLogsListEl = document.getElementById("alertLogsList");
+      const mapStatusEl = document.getElementById("mapStatus");
 
       let refreshTimer = null;
+      let map = null;
+      let markerLayer = null;
+      let hasAutoFitted = false;
 
       function setStatus(message, tone = "") {
         statusEl.textContent = message;
@@ -396,6 +495,126 @@
 
       function renderEmpty(container, message) {
         container.innerHTML = `<div class="item"><strong>Aucune donnee</strong><div class="meta">${message}</div></div>`;
+      }
+
+      function ensureMap() {
+        if (map || typeof L === "undefined") {
+          return;
+        }
+
+        map = L.map("liveMap", {
+          zoomControl: true,
+        }).setView([46.603354, 1.888334], 6);
+
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+          maxZoom: 19,
+          attribution: "&copy; OpenStreetMap contributors",
+        }).addTo(map);
+
+        markerLayer = L.layerGroup().addTo(map);
+      }
+
+      function buildPopup(title, lines) {
+        return `
+          <div style="min-width: 180px;">
+            <strong>${title}</strong>
+            <div style="margin-top: 8px; color: #4b5563; display: grid; gap: 4px;">
+              ${lines.map((line) => `<div>${line}</div>`).join("")}
+            </div>
+          </div>
+        `;
+      }
+
+      function createMapMarker(lat, lng, color, popupHtml) {
+        return L.circleMarker([lat, lng], {
+          radius: 9,
+          color,
+          weight: 3,
+          fillColor: color,
+          fillOpacity: 0.32,
+        }).bindPopup(popupHtml);
+      }
+
+      function renderMap(publicUsers, secoursVehicles) {
+        ensureMap();
+
+        if (!map || !markerLayer) {
+          mapStatusEl.textContent = "Leaflet n'a pas pu etre charge.";
+          return;
+        }
+
+        markerLayer.clearLayers();
+        const bounds = [];
+
+        publicUsers.forEach((user) => {
+          if (typeof user.lat !== "number" || typeof user.lng !== "number") {
+            return;
+          }
+
+          const marker = createMapMarker(
+            user.lat,
+            user.lng,
+            "#0f766e",
+            buildPopup("Usager public", [
+              `Position : ${formatCoords(user.lat, user.lng)}`,
+              `Derniere activite : ${formatDate(user.lastUpdate)}`,
+              `Token ID : ${user.tokenId || user.id}`,
+            ]),
+          );
+
+          markerLayer.addLayer(marker);
+          bounds.push([user.lat, user.lng]);
+        });
+
+        secoursVehicles.forEach((vehicle) => {
+          if (typeof vehicle.lat !== "number" || typeof vehicle.lng !== "number") {
+            return;
+          }
+
+          const marker = createMapMarker(
+            vehicle.lat,
+            vehicle.lng,
+            "#b91c1c",
+            buildPopup("Secours actif", [
+              `Compte : ${vehicle.email || vehicle.uid || "inconnu"}`,
+              `Position : ${formatCoords(vehicle.lat, vehicle.lng)}`,
+              `Derniere activite : ${formatDate(vehicle.lastUpdate)}`,
+            ]),
+          );
+
+          markerLayer.addLayer(marker);
+          bounds.push([vehicle.lat, vehicle.lng]);
+        });
+
+        if (!bounds.length) {
+          mapStatusEl.textContent = "Aucune position active a afficher pour le moment.";
+          if (!hasAutoFitted) {
+            map.setView([46.603354, 1.888334], 6);
+          }
+          return;
+        }
+
+        mapStatusEl.textContent =
+          `${publicUsers.length} public(s) et ${secoursVehicles.length} secours affiches sur la carte.`;
+
+        if (!hasAutoFitted) {
+          map.fitBounds(bounds, {
+            padding: [32, 32],
+            maxZoom: 16,
+          });
+          hasAutoFitted = true;
+          return;
+        }
+
+        const currentBounds = map.getBounds();
+        const hasOutOfViewPoint = bounds.some(([lat, lng]) => !currentBounds.pad(-0.15).contains([lat, lng]));
+
+        if (hasOutOfViewPoint) {
+          map.fitBounds(bounds, {
+            padding: [32, 32],
+            maxZoom: 16,
+          });
+        }
       }
 
       function renderPublicUsers(users) {
@@ -532,6 +751,7 @@
           renderPublicUsers(publicUsersData.users || []);
           renderSecoursVehicles(secoursVehiclesData.vehicles || []);
           renderAlertLogs(alertLogsData.logs || []);
+          renderMap(publicUsersData.users || [], secoursVehiclesData.vehicles || []);
 
           setStatus("Dashboard charge avec succes.", "ok");
 

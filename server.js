@@ -33,7 +33,7 @@ const PUBLIC_PERSIST_INTERVAL_MS = 60_000;
 const PUBLIC_PERSIST_DISTANCE_METERS = 50;
 const SECOURS_PERSIST_INTERVAL_MS = 30_000;
 const SECOURS_PERSIST_DISTANCE_METERS = 25;
-const NOTIFICATION_COOLDOWN_MS = 30_000;
+const NOTIFICATION_COOLDOWN_MS = 15_000;
 const MAX_LOG_RECIPIENTS = 50;
 const REQUIRE_SECOURS_AUTH = process.env.REQUIRE_SECOURS_AUTH !== "false";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
@@ -152,6 +152,16 @@ function cleanupLiveEntries(now = Date.now()) {
   for (const [token, vehicle] of liveSecoursVehicles.entries()) {
     if (now - vehicle.lastUpdate > SECOURS_TTL_MS) {
       liveSecoursVehicles.delete(token);
+    }
+  }
+}
+
+function clearCooldownsForToken(token) {
+  const suffix = `:${token}`;
+
+  for (const key of notificationCooldowns.keys()) {
+    if (key.endsWith(suffix)) {
+      notificationCooldowns.delete(key);
     }
   }
 }
@@ -334,6 +344,37 @@ function findLivePublicUserByTokenId(tokenId) {
   }
 
   return null;
+}
+
+function isUserInsideAnyAlertRadius(user, activeVehicles) {
+  for (const vehicle of activeVehicles) {
+    const userDistance = distance(user.lat, user.lng, vehicle.lat, vehicle.lng);
+
+    if (userDistance <= ALERT_RADIUS_METERS) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function refreshMutedPublicUsers(now = Date.now()) {
+  const activeVehicles = listActiveSecoursVehicles(now);
+
+  for (const user of livePublicUsers.values()) {
+    if (!user.muteUntilExit) {
+      continue;
+    }
+
+    if (isUserInsideAnyAlertRadius(user, activeVehicles)) {
+      continue;
+    }
+
+    user.muteUntilExit = false;
+    user.mutedAt = null;
+    user.mutedUntilExitClearedAt = now;
+    clearCooldownsForToken(user.token);
+  }
 }
 
 async function writeAlertLog(entry) {
@@ -520,6 +561,7 @@ app.get("/admin/alert-logs", requireAdminSecret, async (req, res) => {
 
 app.get("/admin/public-users", requireAdminSecret, async (req, res) => {
   try {
+    refreshMutedPublicUsers();
     const users = listActivePublicUsers();
 
     return res.json({
@@ -531,6 +573,8 @@ app.get("/admin/public-users", requireAdminSecret, async (req, res) => {
         lat: user.lat,
         lng: user.lng,
         modePublic: user.modePublic === true,
+        muteUntilExit: user.muteUntilExit === true,
+        mutedAt: user.mutedAt || null,
         lastUpdate: user.lastUpdate || null,
       })),
     });
@@ -630,6 +674,31 @@ app.post("/admin/test-notification", requireAdminSecret, async (req, res) => {
   }
 });
 
+app.post("/public/mute-alerts", async (req, res) => {
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+
+  if (!token) {
+    return res.status(400).send("token requis");
+  }
+
+  cleanupLiveEntries();
+  const user = livePublicUsers.get(token);
+
+  if (!user || user.modePublic !== true) {
+    return res.status(404).send("Usager public actif introuvable");
+  }
+
+  user.muteUntilExit = true;
+  user.mutedAt = Date.now();
+  clearCooldownsForToken(token);
+
+  return res.json({
+    ok: true,
+    message: "Notifications coupees jusqu'a la sortie du perimetre",
+    tokenId: user.tokenId || buildDocId(user.token),
+  });
+});
+
 app.post("/grant-secours-access", requireAdminSecret, async (req, res) => {
   const { uid, email } = req.body || {};
 
@@ -694,6 +763,7 @@ app.post("/register-user", async (req, res) => {
       lng,
       modePublic,
     });
+    refreshMutedPublicUsers();
 
     if (shouldPersist) {
       await persistPublicUserSnapshot(record);
@@ -804,6 +874,7 @@ async function sendNearbyNotifications({
   bypassCooldown,
 }) {
   cleanupLiveEntries();
+  refreshMutedPublicUsers();
 
   const now = Date.now();
   const activeUsers = listActivePublicUsers(now);
@@ -822,6 +893,10 @@ async function sendNearbyNotifications({
     });
 
     if (userDistance > ALERT_RADIUS_METERS) {
+      continue;
+    }
+
+    if (user.muteUntilExit === true) {
       continue;
     }
 

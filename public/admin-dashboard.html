@@ -275,6 +275,18 @@
         font-size: 0.94rem;
       }
 
+      .item-actions {
+        margin-top: 12px;
+        display: flex;
+        gap: 10px;
+      }
+
+      .item-actions button {
+        padding: 10px 14px;
+        border-radius: 12px;
+        font-size: 0.9rem;
+      }
+
       .logs {
         display: grid;
         gap: 14px;
@@ -633,6 +645,11 @@
                   <div>Mode public : ${user.modePublic ? "oui" : "non"}</div>
                   <div>Derniere activite : ${formatDate(user.lastUpdate)}</div>
                 </div>
+                <div class="item-actions">
+                  <button type="button" data-test-sound="${user.tokenId || user.id}">
+                    Tester le son
+                  </button>
+                </div>
               </div>
             `,
           )
@@ -715,6 +732,24 @@
         return response.json();
       }
 
+      async function postJson(url, secret, body) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Admin-Secret": secret,
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(text || `HTTP ${response.status}`);
+        }
+
+        return response.json();
+      }
+
       function persistSecret(secret) {
         if (rememberCheckbox.checked) {
           sessionStorage.setItem(STORAGE_KEY, secret);
@@ -770,6 +805,34 @@
 
       loadButton.addEventListener("click", loadDashboard);
       refreshButton.addEventListener("click", loadDashboard);
+      publicUsersListEl.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-test-sound]");
+
+        if (!button) {
+          return;
+        }
+
+        const secret = secretInput.value.trim();
+        const tokenId = button.getAttribute("data-test-sound");
+
+        if (!secret) {
+          setStatus("Entre d'abord l'ADMIN_SECRET avant d'envoyer un test.", "error");
+          return;
+        }
+
+        button.disabled = true;
+        setStatus("Envoi du test sonore vers le telephone selectionne...", "");
+
+        try {
+          await postJson("/admin/test-notification", secret, { tokenId });
+          setStatus("Notification de test envoyee. Verifie le telephone cible.", "ok");
+        } catch (error) {
+          console.error(error);
+          setStatus(`Impossible d'envoyer le test : ${error.message}`, "error");
+        } finally {
+          button.disabled = false;
+        }
+      });
       secretInput.addEventListener("keydown", (event) => {
         if (event.key === "Enter") {
           loadDashboard();

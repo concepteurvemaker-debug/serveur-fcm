@@ -326,6 +326,16 @@ function listActiveSecoursVehicles(now = Date.now()) {
   );
 }
 
+function findLivePublicUserByTokenId(tokenId) {
+  for (const user of livePublicUsers.values()) {
+    if ((user.tokenId || buildDocId(user.token)) === tokenId) {
+      return user;
+    }
+  }
+
+  return null;
+}
+
 async function writeAlertLog(entry) {
   await db.collection(COLLECTIONS.alertLogs).add({
     ...entry,
@@ -556,6 +566,65 @@ app.get("/admin/secours-vehicles", requireAdminSecret, async (req, res) => {
     return res.status(500).json({
       ok: false,
       message: "Impossible de lire les vehicules secours",
+      error: error.message,
+    });
+  }
+});
+
+app.post("/admin/test-notification", requireAdminSecret, async (req, res) => {
+  const tokenId =
+    typeof req.body?.tokenId === "string" ? req.body.tokenId.trim() : "";
+
+  if (!tokenId) {
+    return res.status(400).send("tokenId requis");
+  }
+
+  cleanupLiveEntries();
+  const user = findLivePublicUserByTokenId(tokenId);
+
+  if (!user) {
+    return res.status(404).send("Usager public actif introuvable");
+  }
+
+  const title =
+    typeof req.body?.title === "string" && req.body.title.trim()
+      ? req.body.title.trim()
+      : "Test sonore SecoursProximity";
+  const body =
+    typeof req.body?.body === "string" && req.body.body.trim()
+      ? req.body.body.trim()
+      : "Notification de test envoyee depuis le dashboard admin.";
+
+  try {
+    const messageId = await admin.messaging().send({
+      token: user.token,
+      android: {
+        priority: "high",
+      },
+      data: {
+        type: "admin_sound_test",
+        title,
+        body,
+      },
+    });
+
+    console.log("Admin test notification:", {
+      tokenId,
+      messageId,
+      lat: user.lat,
+      lng: user.lng,
+    });
+
+    return res.json({
+      ok: true,
+      tokenId,
+      messageId,
+    });
+  } catch (error) {
+    console.error("Erreur admin/test-notification:", error);
+    return res.status(500).json({
+      ok: false,
+      message: "Impossible d'envoyer la notification de test",
       error: error.message,
     });
   }

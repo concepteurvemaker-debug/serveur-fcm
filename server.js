@@ -27,10 +27,13 @@ const COLLECTIONS = {
 };
 
 const ALERT_RADIUS_METERS = 150;
-const USER_TTL_MS = 60_000;
-const SECOURS_TTL_MS = 15_000;
+const USER_TTL_MS = 180_000;
+const SECOURS_TTL_MS = 90_000;
+const PUBLIC_PERSIST_INTERVAL_MS = 60_000;
+const PUBLIC_PERSIST_DISTANCE_METERS = 50;
+const SECOURS_PERSIST_INTERVAL_MS = 30_000;
+const SECOURS_PERSIST_DISTANCE_METERS = 25;
 const NOTIFICATION_COOLDOWN_MS = 30_000;
-const FIRESTORE_CLEANUP_INTERVAL_MS = 60_000;
 const MAX_LOG_RECIPIENTS = 50;
 const REQUIRE_SECOURS_AUTH = process.env.REQUIRE_SECOURS_AUTH !== "false";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
@@ -51,8 +54,9 @@ const SECOURS_EMAIL_DOMAINS = new Set(
     .filter(Boolean),
 );
 
+const livePublicUsers = new Map();
+const liveSecoursVehicles = new Map();
 const notificationCooldowns = new Map();
-let lastFirestoreCleanupAt = 0;
 
 function toFiniteNumber(value) {
   const parsed = Number(value);
@@ -136,83 +140,161 @@ function cleanupCooldowns(now = Date.now()) {
   }
 }
 
-async function pruneStaleDocuments(collectionName, ttlMs, now = Date.now()) {
-  const threshold = now - ttlMs;
-
-  while (true) {
-    const snapshot = await db
-      .collection(collectionName)
-      .where("lastUpdate", "<", threshold)
-      .limit(200)
-      .get();
-
-    if (snapshot.empty) {
-      return;
-    }
-
-    const batch = db.batch();
-    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
-    await batch.commit();
-
-    if (snapshot.size < 200) {
-      return;
-    }
-  }
-}
-
-async function cleanupInactiveEntries({ force = false } = {}) {
-  const now = Date.now();
+function cleanupLiveEntries(now = Date.now()) {
   cleanupCooldowns(now);
 
-  if (!force && now - lastFirestoreCleanupAt < FIRESTORE_CLEANUP_INTERVAL_MS) {
-    return;
+  for (const [token, user] of livePublicUsers.entries()) {
+    if (now - user.lastUpdate > USER_TTL_MS) {
+      livePublicUsers.delete(token);
+    }
   }
 
-  const results = await Promise.allSettled([
-    pruneStaleDocuments(COLLECTIONS.publicUsers, USER_TTL_MS, now),
-    pruneStaleDocuments(COLLECTIONS.secoursVehicles, SECOURS_TTL_MS, now),
-  ]);
-
-  results.forEach((result, index) => {
-    if (result.status === "rejected") {
-      const target =
-        index === 0 ? COLLECTIONS.publicUsers : COLLECTIONS.secoursVehicles;
-      console.error(`Erreur cleanup Firestore ${target}:`, result.reason);
+  for (const [token, vehicle] of liveSecoursVehicles.entries()) {
+    if (now - vehicle.lastUpdate > SECOURS_TTL_MS) {
+      liveSecoursVehicles.delete(token);
     }
-  });
-
-  lastFirestoreCleanupAt = now;
+  }
 }
 
-async function upsertPublicUser({ token, lat, lng, modePublic }) {
-  const docId = buildDocId(token);
+function distance(lat1, lon1, lat2, lon2) {
+  const earthRadiusMeters = 6371e3;
+  const phi1 = (lat1 * Math.PI) / 180;
+  const phi2 = (lat2 * Math.PI) / 180;
+  const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
+  const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
 
-  await db.collection(COLLECTIONS.publicUsers).doc(docId).set(
-    {
-      token,
-      tokenId: docId,
+  const a =
+    Math.sin(deltaPhi / 2) ** 2 +
+    Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return earthRadiusMeters * c;
+}
+
+function shouldPersistSnapshot({
+  previousRecord,
+  lat,
+  lng,
+  timestampMs,
+  minIntervalMs,
+  minDistanceMeters,
+}) {
+  if (!previousRecord) {
+    return true;
+  }
+
+  const lastPersistAt = previousRecord.lastPersistAt || 0;
+  const lastPersistLat = previousRecord.lastPersistLat ?? previousRecord.lat;
+  const lastPersistLng = previousRecord.lastPersistLng ?? previousRecord.lng;
+  const enoughTime = timestampMs - lastPersistAt >= minIntervalMs;
+  const movedMeters = distance(lastPersistLat, lastPersistLng, lat, lng);
+  const enoughDistance =
+    !Number.isFinite(movedMeters) || movedMeters >= minDistanceMeters;
+
+  return enoughTime || enoughDistance;
+}
+
+function upsertLivePublicUser({ token, lat, lng, modePublic }) {
+  const now = Date.now();
+  const previousRecord = livePublicUsers.get(token) || null;
+  const shouldPersist =
+    !previousRecord ||
+    previousRecord.modePublic !== modePublic ||
+    shouldPersistSnapshot({
+      previousRecord,
       lat,
       lng,
-      modePublic,
-      lastUpdate: Date.now(),
+      timestampMs: now,
+      minIntervalMs: PUBLIC_PERSIST_INTERVAL_MS,
+      minDistanceMeters: PUBLIC_PERSIST_DISTANCE_METERS,
+    });
+
+  const nextRecord = {
+    ...(previousRecord || {}),
+    token,
+    tokenId: buildDocId(token),
+    lat,
+    lng,
+    modePublic,
+    lastUpdate: now,
+  };
+
+  if (shouldPersist) {
+    nextRecord.lastPersistAt = now;
+    nextRecord.lastPersistLat = lat;
+    nextRecord.lastPersistLng = lng;
+  }
+
+  livePublicUsers.set(token, nextRecord);
+
+  return {
+    record: nextRecord,
+    shouldPersist,
+  };
+}
+
+function upsertLiveSecoursVehicle({ token, lat, lng, authUser }) {
+  const now = Date.now();
+  const previousRecord = liveSecoursVehicles.get(token) || null;
+  const shouldPersist = shouldPersistSnapshot({
+    previousRecord,
+    lat,
+    lng,
+    timestampMs: now,
+    minIntervalMs: SECOURS_PERSIST_INTERVAL_MS,
+    minDistanceMeters: SECOURS_PERSIST_DISTANCE_METERS,
+  });
+
+  const nextRecord = {
+    ...(previousRecord || {}),
+    token,
+    tokenId: buildDocId(token),
+    uid: authUser?.uid || null,
+    email: authUser?.email || null,
+    lat,
+    lng,
+    lastUpdate: now,
+  };
+
+  if (shouldPersist) {
+    nextRecord.lastPersistAt = now;
+    nextRecord.lastPersistLat = lat;
+    nextRecord.lastPersistLng = lng;
+  }
+
+  liveSecoursVehicles.set(token, nextRecord);
+
+  return {
+    record: nextRecord,
+    shouldPersist,
+  };
+}
+
+async function persistPublicUserSnapshot(userRecord) {
+  await db.collection(COLLECTIONS.publicUsers).doc(userRecord.tokenId).set(
+    {
+      token: userRecord.token,
+      tokenId: userRecord.tokenId,
+      lat: userRecord.lat,
+      lng: userRecord.lng,
+      modePublic: userRecord.modePublic,
+      lastUpdate: userRecord.lastUpdate,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true },
   );
 }
 
-async function upsertSecoursVehicle({ token, lat, lng, authUser }) {
-  const docId = buildDocId(token);
-
-  await db.collection(COLLECTIONS.secoursVehicles).doc(docId).set(
+async function persistSecoursVehicleSnapshot(vehicleRecord) {
+  await db.collection(COLLECTIONS.secoursVehicles).doc(vehicleRecord.tokenId).set(
     {
-      token,
-      tokenId: docId,
-      uid: authUser?.uid || null,
-      email: authUser?.email || null,
-      lat,
-      lng,
-      lastUpdate: Date.now(),
+      token: vehicleRecord.token,
+      tokenId: vehicleRecord.tokenId,
+      uid: vehicleRecord.uid,
+      email: vehicleRecord.email,
+      lat: vehicleRecord.lat,
+      lng: vehicleRecord.lng,
+      lastUpdate: vehicleRecord.lastUpdate,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     },
     { merge: true },
@@ -220,25 +302,28 @@ async function upsertSecoursVehicle({ token, lat, lng, authUser }) {
 }
 
 async function removePublicUserByToken(token) {
+  livePublicUsers.delete(token);
+
   await db
     .collection(COLLECTIONS.publicUsers)
     .doc(buildDocId(token))
     .delete();
 }
 
-async function listActivePublicUsers() {
-  const threshold = Date.now() - USER_TTL_MS;
-  const snapshot = await db
-    .collection(COLLECTIONS.publicUsers)
-    .where("lastUpdate", ">=", threshold)
-    .get();
+function listActivePublicUsers(now = Date.now()) {
+  cleanupLiveEntries(now);
 
-  return snapshot.docs
-    .map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }))
-    .filter((user) => user.modePublic === true);
+  return Array.from(livePublicUsers.values())
+    .filter((user) => user.modePublic === true)
+    .sort((a, b) => (b.lastUpdate || 0) - (a.lastUpdate || 0));
+}
+
+function listActiveSecoursVehicles(now = Date.now()) {
+  cleanupLiveEntries(now);
+
+  return Array.from(liveSecoursVehicles.values()).sort(
+    (a, b) => (b.lastUpdate || 0) - (a.lastUpdate || 0),
+  );
 }
 
 async function writeAlertLog(entry) {
@@ -334,21 +419,6 @@ async function setSecoursClaim({ uid, email, enabled }) {
   };
 }
 
-function distance(lat1, lon1, lat2, lon2) {
-  const earthRadiusMeters = 6371e3;
-  const phi1 = (lat1 * Math.PI) / 180;
-  const phi2 = (lat2 * Math.PI) / 180;
-  const deltaPhi = ((lat2 - lat1) * Math.PI) / 180;
-  const deltaLambda = ((lon2 - lon1) * Math.PI) / 180;
-
-  const a =
-    Math.sin(deltaPhi / 2) ** 2 +
-    Math.cos(phi1) * Math.cos(phi2) * Math.sin(deltaLambda / 2) ** 2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-  return earthRadiusMeters * c;
-}
-
 app.get("/", (req, res) => {
   res.send("Serveur FCM OK");
 });
@@ -377,6 +447,10 @@ app.get("/debug/firestore", requireAdminSecret, async (req, res) => {
     return res.json({
       ok: true,
       firebaseProjectId: serviceAccount.project_id || null,
+      memory: {
+        publicUsers: listActivePublicUsers().length,
+        secoursVehicles: listActiveSecoursVehicles().length,
+      },
       collections: {
         publicUsers: {
           count: publicUsersSnapshot.size,
@@ -406,8 +480,8 @@ app.get("/admin/alert-logs", requireAdminSecret, async (req, res) => {
   const parsedLimit = Number(req.query.limit);
   const limit =
     Number.isFinite(parsedLimit) && parsedLimit > 0
-      ? Math.min(Math.floor(parsedLimit), 100)
-      : 20;
+      ? Math.min(Math.floor(parsedLimit), 50)
+      : 10;
 
   try {
     const snapshot = await db
@@ -436,21 +510,19 @@ app.get("/admin/alert-logs", requireAdminSecret, async (req, res) => {
 
 app.get("/admin/public-users", requireAdminSecret, async (req, res) => {
   try {
-    const users = await listActivePublicUsers();
+    const users = listActivePublicUsers();
 
     return res.json({
       ok: true,
       count: users.length,
-      users: users
-        .sort((a, b) => (b.lastUpdate || 0) - (a.lastUpdate || 0))
-        .map((user) => ({
-          id: user.id,
-          tokenId: user.tokenId || user.id,
-          lat: user.lat,
-          lng: user.lng,
-          modePublic: user.modePublic === true,
-          lastUpdate: user.lastUpdate || null,
-        })),
+      users: users.map((user) => ({
+        id: user.tokenId || user.token,
+        tokenId: user.tokenId || buildDocId(user.token),
+        lat: user.lat,
+        lng: user.lng,
+        modePublic: user.modePublic === true,
+        lastUpdate: user.lastUpdate || null,
+      })),
     });
   } catch (error) {
     console.error("Erreur admin/public-users:", error);
@@ -463,34 +535,21 @@ app.get("/admin/public-users", requireAdminSecret, async (req, res) => {
 });
 
 app.get("/admin/secours-vehicles", requireAdminSecret, async (req, res) => {
-  const threshold = Date.now() - SECOURS_TTL_MS;
-
   try {
-    const snapshot = await db
-      .collection(COLLECTIONS.secoursVehicles)
-      .where("lastUpdate", ">=", threshold)
-      .get();
+    const vehicles = listActiveSecoursVehicles();
 
-    const vehicles = snapshot.docs
-      .map((doc) => ({
-        id: doc.id,
-        ...doc.data(),
-      }))
-      .sort((a, b) => (b.lastUpdate || 0) - (a.lastUpdate || 0))
-      .map((vehicle) => ({
-        id: vehicle.id,
-        tokenId: vehicle.tokenId || vehicle.id,
+    return res.json({
+      ok: true,
+      count: vehicles.length,
+      vehicles: vehicles.map((vehicle) => ({
+        id: vehicle.tokenId || vehicle.token,
+        tokenId: vehicle.tokenId || buildDocId(vehicle.token),
         uid: vehicle.uid || null,
         email: vehicle.email || null,
         lat: vehicle.lat,
         lng: vehicle.lng,
         lastUpdate: vehicle.lastUpdate || null,
-      }));
-
-    return res.json({
-      ok: true,
-      count: vehicles.length,
-      vehicles,
+      })),
     });
   } catch (error) {
     console.error("Erreur admin/secours-vehicles:", error);
@@ -558,10 +617,27 @@ app.post("/register-user", async (req, res) => {
   }
 
   try {
-    await cleanupInactiveEntries();
-    await upsertPublicUser({ token, lat, lng, modePublic });
+    cleanupLiveEntries();
 
-    console.log("User updated:", { token, lat, lng, modePublic });
+    const { record, shouldPersist } = upsertLivePublicUser({
+      token,
+      lat,
+      lng,
+      modePublic,
+    });
+
+    if (shouldPersist) {
+      await persistPublicUserSnapshot(record);
+    }
+
+    console.log("User updated:", {
+      token,
+      lat,
+      lng,
+      modePublic,
+      persisted: shouldPersist,
+    });
+
     return res.send("Utilisateur enregistre ou mis a jour");
   } catch (error) {
     console.error("Erreur register-user:", error);
@@ -578,13 +654,18 @@ app.post("/update-position", authenticateSecours, async (req, res) => {
   }
 
   try {
-    await cleanupInactiveEntries();
-    await upsertSecoursVehicle({
+    cleanupLiveEntries();
+
+    const { record, shouldPersist } = upsertLiveSecoursVehicle({
       token,
       lat,
       lng,
       authUser: req.authUser,
     });
+
+    if (shouldPersist) {
+      await persistSecoursVehicleSnapshot(record);
+    }
 
     console.log("Secours updated:", {
       uid: req.authUser.uid,
@@ -592,6 +673,7 @@ app.post("/update-position", authenticateSecours, async (req, res) => {
       token,
       lat,
       lng,
+      persisted: shouldPersist,
     });
 
     const result = await sendNearbyNotifications({
@@ -652,10 +734,10 @@ async function sendNearbyNotifications({
   authUser,
   bypassCooldown,
 }) {
-  await cleanupInactiveEntries();
+  cleanupLiveEntries();
 
   const now = Date.now();
-  const activeUsers = await listActivePublicUsers();
+  const activeUsers = listActivePublicUsers(now);
   const messages = [];
   const recipientSummaries = [];
 
@@ -696,7 +778,7 @@ async function sendNearbyNotifications({
     });
 
     recipientSummaries.push({
-      userId: user.id,
+      userId: user.tokenId || user.token,
       distanceMeters: Math.round(userDistance),
     });
 
@@ -706,23 +788,25 @@ async function sendNearbyNotifications({
   if (messages.length === 0) {
     console.log("Aucun usager a proximite pour notification");
 
-    await writeAlertLog({
-      sourceId,
-      sourceType,
-      sourceTokenId: sourceToken ? buildDocId(sourceToken) : null,
-      initiatorUid: authUser?.uid || null,
-      initiatorEmail: authUser?.email || null,
-      lat,
-      lng,
-      bypassCooldown,
-      candidateUserCount: activeUsers.length,
-      notifiedUserCount: 0,
-      successCount: 0,
-      failureCount: 0,
-      outcome: "no_recipients",
-      recipients: [],
-      eventTimestampMs: now,
-    });
+    if (sourceType !== "position_update") {
+      await writeAlertLog({
+        sourceId,
+        sourceType,
+        sourceTokenId: sourceToken ? buildDocId(sourceToken) : null,
+        initiatorUid: authUser?.uid || null,
+        initiatorEmail: authUser?.email || null,
+        lat,
+        lng,
+        bypassCooldown,
+        candidateUserCount: activeUsers.length,
+        notifiedUserCount: 0,
+        successCount: 0,
+        failureCount: 0,
+        outcome: "no_recipients",
+        recipients: [],
+        eventTimestampMs: now,
+      });
+    }
 
     return 0;
   }
@@ -782,9 +866,7 @@ async function sendNearbyNotifications({
 }
 
 setInterval(() => {
-  cleanupInactiveEntries().catch((error) => {
-    console.error("Erreur cleanup periodique Firestore:", error);
-  });
+  cleanupLiveEntries();
 }, 10_000);
 
 const PORT = process.env.PORT || 3000;

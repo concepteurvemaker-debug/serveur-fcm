@@ -33,7 +33,7 @@ const PUBLIC_PERSIST_INTERVAL_MS = 60_000;
 const PUBLIC_PERSIST_DISTANCE_METERS = 50;
 const SECOURS_PERSIST_INTERVAL_MS = 30_000;
 const SECOURS_PERSIST_DISTANCE_METERS = 25;
-const NOTIFICATION_COOLDOWN_MS = 15_000;
+const NOTIFICATION_COOLDOWN_MS = 6_000;
 const MAX_LOG_RECIPIENTS = 50;
 const REQUIRE_SECOURS_AUTH = process.env.REQUIRE_SECOURS_AUTH !== "false";
 const ADMIN_SECRET = process.env.ADMIN_SECRET || null;
@@ -911,6 +911,8 @@ async function sendNearbyNotifications({
       token: user.token,
       android: {
         priority: "high",
+        ttl: 8_000,
+        collapseKey: "emergency_nearby",
       },
       data: {
         type: "emergency_nearby",
@@ -918,6 +920,7 @@ async function sendNearbyNotifications({
         body: "Un vehicule d'urgence approche dans votre zone.",
         radiusMeters: String(ALERT_RADIUS_METERS),
         sourceId: String(sourceId),
+        pulseAtMs: String(now),
       },
     });
 

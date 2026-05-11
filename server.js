@@ -320,6 +320,23 @@ async function removePublicUserByToken(token) {
     .delete();
 }
 
+async function removeSecoursVehicleByToken(token) {
+  const tokenId = buildDocId(token);
+  const vehicleRecord = liveSecoursVehicles.get(token) || null;
+
+  liveSecoursVehicles.delete(token);
+
+  await db
+    .collection(COLLECTIONS.secoursVehicles)
+    .doc(tokenId)
+    .delete()
+    .catch((error) => {
+      console.error("Erreur suppression vehicule secours Firestore:", error);
+    });
+
+  return vehicleRecord;
+}
+
 function listActivePublicUsers(now = Date.now()) {
   cleanupLiveEntries(now);
 
@@ -375,6 +392,92 @@ function refreshMutedPublicUsers(now = Date.now()) {
     user.mutedUntilExitClearedAt = now;
     clearCooldownsForToken(user.token);
   }
+}
+
+async function sendEmergencyClearedNotifications({
+  stoppedVehicle,
+  sourceId,
+  authUser,
+}) {
+  if (!stoppedVehicle) {
+    return 0;
+  }
+
+  cleanupLiveEntries();
+  refreshMutedPublicUsers();
+
+  const remainingVehicles = listActiveSecoursVehicles();
+  const activeUsers = listActivePublicUsers();
+  const messages = [];
+  const recipients = [];
+
+  for (const user of activeUsers) {
+    const distanceToStoppedVehicle = distance(
+      stoppedVehicle.lat,
+      stoppedVehicle.lng,
+      user.lat,
+      user.lng,
+    );
+
+    if (distanceToStoppedVehicle > ALERT_RADIUS_METERS) {
+      continue;
+    }
+
+    if (isUserInsideAnyAlertRadius(user, remainingVehicles)) {
+      continue;
+    }
+
+    clearCooldownsForToken(user.token);
+    user.muteUntilExit = false;
+    user.mutedAt = null;
+
+    messages.push({
+      token: user.token,
+      android: {
+        priority: "high",
+        ttl: 8_000,
+        collapseKey: "emergency_nearby",
+      },
+      data: {
+        type: "emergency_cleared",
+        title: "Alerte terminee",
+        body: "Le vehicule d'urgence a quitte votre zone.",
+        sourceId: String(sourceId),
+        pulseAtMs: String(Date.now()),
+      },
+    });
+
+    recipients.push({
+      userId: user.tokenId || user.token,
+      distanceMeters: Math.round(distanceToStoppedVehicle),
+    });
+  }
+
+  if (messages.length === 0) {
+    return 0;
+  }
+
+  const response = await admin.messaging().sendEach(messages);
+
+  await writeAlertLog({
+    sourceId,
+    sourceType: "intervention_stopped",
+    sourceTokenId: stoppedVehicle.tokenId || buildDocId(stoppedVehicle.token),
+    initiatorUid: authUser?.uid || null,
+    initiatorEmail: authUser?.email || null,
+    lat: stoppedVehicle.lat,
+    lng: stoppedVehicle.lng,
+    bypassCooldown: true,
+    candidateUserCount: activeUsers.length,
+    notifiedUserCount: messages.length,
+    successCount: response.successCount,
+    failureCount: response.failureCount,
+    outcome: response.failureCount > 0 ? "partial" : "sent",
+    recipients,
+    eventTimestampMs: Date.now(),
+  });
+
+  return response.successCount;
 }
 
 async function writeAlertLog(entry) {
@@ -861,6 +964,41 @@ app.post("/alert", authenticateSecours, async (req, res) => {
   } catch (error) {
     console.error("Erreur alert:", error);
     return res.status(500).send("Erreur lors de l'envoi de l'alerte");
+  }
+});
+
+app.post("/stop-intervention", authenticateSecours, async (req, res) => {
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+
+  if (!token) {
+    return res.status(400).send("token requis");
+  }
+
+  try {
+    cleanupLiveEntries();
+
+    const stoppedVehicle = await removeSecoursVehicleByToken(token);
+    const clearedCount = await sendEmergencyClearedNotifications({
+      stoppedVehicle,
+      sourceId: `${req.authUser.uid}-stop-${Date.now()}`,
+      authUser: req.authUser,
+    });
+
+    console.log("Intervention stopped:", {
+      uid: req.authUser.uid,
+      email: req.authUser.email,
+      token,
+      clearedCount,
+    });
+
+    return res.json({
+      ok: true,
+      clearedCount,
+      hadActiveVehicle: Boolean(stoppedVehicle),
+    });
+  } catch (error) {
+    console.error("Erreur stop-intervention:", error);
+    return res.status(500).send("Erreur lors de l'arret de l'intervention");
   }
 });
 

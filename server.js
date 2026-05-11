@@ -1044,6 +1044,9 @@ async function sendNearbyNotifications({
   const activeUsers = listActivePublicUsers(now);
   const messages = [];
   const recipientSummaries = [];
+  let withinRadiusCount = 0;
+  let mutedSkippedCount = 0;
+  let cooldownSkippedCount = 0;
 
   for (const user of activeUsers) {
     const userDistance = distance(lat, lng, user.lat, user.lng);
@@ -1060,7 +1063,10 @@ async function sendNearbyNotifications({
       continue;
     }
 
-    if (user.muteUntilExit === true) {
+    withinRadiusCount += 1;
+
+    if (user.muteUntilExit === true && sourceType !== "manual_alert") {
+      mutedSkippedCount += 1;
       continue;
     }
 
@@ -1068,6 +1074,7 @@ async function sendNearbyNotifications({
     const lastSentAt = notificationCooldowns.get(cooldownKey);
 
     if (!bypassCooldown && lastSentAt && now - lastSentAt < NOTIFICATION_COOLDOWN_MS) {
+      cooldownSkippedCount += 1;
       continue;
     }
 
@@ -1097,7 +1104,13 @@ async function sendNearbyNotifications({
   }
 
   if (messages.length === 0) {
-    console.log("Aucun usager a proximite pour notification");
+    console.log("Aucun usager a proximite pour notification", {
+      sourceType,
+      activeUsers: activeUsers.length,
+      withinRadiusCount,
+      mutedSkippedCount,
+      cooldownSkippedCount,
+    });
 
     if (sourceType !== "position_update") {
       await writeAlertLog({
@@ -1121,6 +1134,15 @@ async function sendNearbyNotifications({
 
     return 0;
   }
+
+  console.log("Notifications candidates:", {
+    sourceType,
+    activeUsers: activeUsers.length,
+    withinRadiusCount,
+    mutedSkippedCount,
+    cooldownSkippedCount,
+    messages: messages.length,
+  });
 
   const response = await admin.messaging().sendEach(messages);
   const failedDeletes = [];

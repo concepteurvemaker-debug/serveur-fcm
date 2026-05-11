@@ -802,6 +802,32 @@ app.post("/public/mute-alerts", async (req, res) => {
   });
 });
 
+app.post("/public/unmute-alerts", async (req, res) => {
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+
+  if (!token) {
+    return res.status(400).send("token requis");
+  }
+
+  cleanupLiveEntries();
+  const user = livePublicUsers.get(token);
+
+  if (!user || user.modePublic !== true) {
+    return res.status(404).send("Usager public actif introuvable");
+  }
+
+  user.muteUntilExit = false;
+  user.mutedAt = null;
+  user.mutedUntilExitClearedAt = Date.now();
+  clearCooldownsForToken(token);
+
+  return res.json({
+    ok: true,
+    message: "Notifications publiques reactivees",
+    tokenId: user.tokenId || buildDocId(user.token),
+  });
+});
+
 app.post("/grant-secours-access", requireAdminSecret, async (req, res) => {
   const { uid, email } = req.body || {};
 

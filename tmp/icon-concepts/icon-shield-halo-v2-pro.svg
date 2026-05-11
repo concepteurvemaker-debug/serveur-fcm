@@ -1,0 +1,28 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#162338"/>
+      <stop offset="100%" stop-color="#0a111c"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="50%" cy="42%" r="38%">
+      <stop offset="0%" stop-color="#9ceff6" stop-opacity="0.48"/>
+      <stop offset="55%" stop-color="#9ceff6" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#9ceff6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="shield" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f35c49"/>
+      <stop offset="100%" stop-color="#c8241f"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="72" y="72" width="880" height="880" rx="220" fill="url(#bg)"/>
+
+  <circle cx="512" cy="452" r="280" fill="url(#halo)"/>
+  <circle cx="512" cy="452" r="220" fill="none" stroke="#8ddde8" stroke-width="18" opacity="0.22"/>
+
+  <path d="M512 238c106 70 193 70 193 70v166c0 151-110 258-193 330-83-72-193-179-193-330V308s87 0 193-70Z" fill="url(#shield)"/>
+  <path d="M512 278c76 46 139 48 139 48v140c0 101-68 178-139 244-71-66-139-143-139-244V326s63-2 139-48Z" fill="none" stroke="#ffffff" stroke-opacity="0.2" stroke-width="12"/>
+
+  <rect x="478" y="364" width="68" height="276" rx="20" fill="#f8fbff"/>
+  <rect x="408" y="434" width="208" height="68" rx="20" fill="#f8fbff"/>
+</svg>

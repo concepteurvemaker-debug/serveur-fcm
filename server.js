@@ -1047,6 +1047,7 @@ async function sendNearbyNotifications({
   let withinRadiusCount = 0;
   let mutedSkippedCount = 0;
   let cooldownSkippedCount = 0;
+  let sourceTokenSkippedCount = 0;
 
   for (const user of activeUsers) {
     const userDistance = distance(lat, lng, user.lat, user.lng);
@@ -1064,6 +1065,11 @@ async function sendNearbyNotifications({
     }
 
     withinRadiusCount += 1;
+
+    if (sourceToken && user.token === sourceToken) {
+      sourceTokenSkippedCount += 1;
+      continue;
+    }
 
     if (user.muteUntilExit === true && sourceType !== "manual_alert") {
       mutedSkippedCount += 1;
@@ -1108,6 +1114,7 @@ async function sendNearbyNotifications({
       sourceType,
       activeUsers: activeUsers.length,
       withinRadiusCount,
+      sourceTokenSkippedCount,
       mutedSkippedCount,
       cooldownSkippedCount,
     });
@@ -1139,6 +1146,7 @@ async function sendNearbyNotifications({
     sourceType,
     activeUsers: activeUsers.length,
     withinRadiusCount,
+    sourceTokenSkippedCount,
     mutedSkippedCount,
     cooldownSkippedCount,
     messages: messages.length,
